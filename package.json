@@ -1,0 +1,19 @@
+{
+  "name": "litmus-intelligent-contract",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Litmus: rules that must pass their own test under validator consensus (GenLayer, GenVM v0.2.16).",
+  "type": "module",
+  "scripts": {
+    "e2e": "node scripts/live_e2e.mjs",
+    "e2e:fast": "node scripts/live_e2e.mjs --skip-slow",
+    "e2e:dry": "node scripts/live_e2e.mjs --dry-run",
+    "verify:source": "node scripts/verify_deployed_source.mjs"
+  },
+  "dependencies": {
+    "genlayer-js": "1.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
