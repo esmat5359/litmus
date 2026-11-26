@@ -109,3 +109,27 @@ def test_state_is_written_after_the_model_call_in_every_judging_method():
         judge_line = next(i for i, line in enumerate(body) if "judge(" in line)
         for line in body[:judge_line]:
             assert not any(m in line for m in mutators), f"{name} mutates state before judge(): {line.strip()}"
+
+
+def test_only_deposit_accepts_value():
+    """A rejected call keeps the value attached to it, so value may only enter through a method that cannot fail."""
+    payable = []
+    for node in ast.walk(TREE):
+        if isinstance(node, ast.FunctionDef):
+            for deco in node.decorator_list:
+                if ast.unparse(deco) == "gl.public.write.payable":
+                    payable.append(node.name)
+    assert payable == ["deposit"], payable
+    deposit = ast.unparse(function("deposit"))
+    assert "_accept_value()" in deposit and "_require" not in deposit
+    accept = ast.unparse(function("_accept_value"))
+    assert accept.count("_require") == 1 and "positive value" in accept          # the only refusal is value == 0
+    body = accept.splitlines()
+    require_line = next(i for i, line in enumerate(body) if "_require" in line)
+    assert all("escrow_total" not in line and "_credit" not in line for line in body[: require_line + 1])
+
+
+def test_value_is_never_read_outside_deposit_and_the_funding_helper():
+    for node in ast.walk(TREE):
+        if isinstance(node, ast.FunctionDef) and node.name not in {"_accept_value"}:
+            assert "gl.message.value" not in ast.unparse(node), f"{node.name} reads gl.message.value"

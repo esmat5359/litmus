@@ -3,12 +3,15 @@
  * LITMUS live end-to-end run for GenLayer Studionet (GenVM v0.2.16 contract).
  *
  *   npm ci
- *   node scripts/live_e2e.mjs                 # full run (about 25-40 minutes on Studionet)
+ *   node scripts/live_e2e.mjs                 # full run (about 45-70 minutes on the public RPC)
  *   node scripts/live_e2e.mjs --skip-slow     # skips the two-window timeout case
  *   node scripts/live_e2e.mjs --dry-run       # no network: runs against the in-process JS model
  *
  * Environment: LITMUS_KEYS=0xkey1,0xkey2,... (optional, 5 pre-funded keys; otherwise fresh accounts are
  * created and funded with the Studio RPC method sim_fundAccount).  GENLAYER_RPC overrides the RPC URL.
+ *
+ * Funding model: value only enters through deposit(); every other call is non-payable and spends ledger
+ * balance, so a rejected call can never strand funds (the first live run proved a rejected call keeps its value).
  *
  * Truth model: every step is verified against CONTRACT STATE (read back through the views), never against
  * receipt field names alone.  Language-model steps are retried because validators may legitimately fail to
@@ -28,7 +31,7 @@ const DRY = Boolean(argv['dry-run']);
 const SKIP_SLOW = Boolean(argv['skip-slow']);
 const STRICT = Boolean(argv.strict);
 const LLM_ATTEMPTS = Number(argv['llm-attempts'] ?? 3);
-const FINALITY_MIN = Number(argv['finality-timeout-min'] ?? 10);
+const FINALITY_MIN = Number(argv['finality-timeout-min'] ?? 35);
 const OUT_DIR = resolve(ROOT, String(argv['out-dir'] ?? 'reports'));
 const RPC = argv.rpc ?? process.env.GENLAYER_RPC ?? 'https://studio.genlayer.com/api';
 const EXPLORER = 'https://explorer-studio.genlayer.com/tx/';
@@ -85,6 +88,14 @@ class Abort extends Error {}
 
 // ------------------------------------------------------------------------------------------ chain + context
 let chain; let address; let ACCTS = {};
+const SENT = new Map();        // native value each wallet attached to calls (only deposit() takes any)
+const START = new Map();       // wallet balances right after funding
+const WITHDRAWN = new Map();   // ledger balances each wallet withdrew
+async function fundLedger(who, amount, label) {
+  const before = await claimable(who);
+  const res = await tx(`deposit ${label}`, who, 'deposit', [], { value: amount, verify: async () => (await claimable(who)) >= before + amount });
+  if (!res.ok) throw new Abort(`could not fund the ledger for ${label}`);
+}
 const nowSec = () => Math.floor(chain.now() / 1000);
 const wallet = (who) => who.address.toLowerCase();
 const view = async (fn, args = []) => parseView(await eventually(async () => chain.read(address, fn, args), { timeoutMs: 120_000, sleep: (ms) => chain.sleep(ms), now: () => chain.now() }) || (() => { throw new Error(`view ${fn} failed`); })());
@@ -97,23 +108,32 @@ const until = (fn, timeoutMs = 90_000) => eventually(fn, { timeoutMs, intervalMs
 
 async function tx(label, who, fn, args, opts = {}) {
   const { value = 0n, kind = 'det', expectFail = false, verify = null, unchanged = null } = opts;
-  const attempts = opts.attempts ?? (kind === 'llm' ? LLM_ATTEMPTS : 2);
+  const sentKey = who.address.toLowerCase();
+  const attempts = opts.attempts ?? (kind === 'llm' ? LLM_ATTEMPTS : expectFail ? 3 : 2);
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const started = Date.now();
     let receipt;
     try { receipt = await chain.send(who, address, fn, args, value); }
     catch (error) { receipt = { hash: null, status: 'SEND_ERROR', executionOk: false, error: String(error?.message ?? error).slice(0, 300), votes: [] }; }
-    report.txs.push({ label, fn, attempt, hash: receipt.hash, status: receipt.status, executionOk: receipt.executionOk, error: receipt.error, votes: receipt.votes,
+    if (value > 0n && receipt.status !== 'SEND_ERROR') SENT.set(sentKey, (SENT.get(sentKey) ?? 0n) + value);
+    report.txs.push({ label, fn, attempt, at: new Date().toISOString(), value: String(value), hash: receipt.hash, status: receipt.status, executionOk: receipt.executionOk, error: receipt.error, votes: receipt.votes,
       seconds: Math.round((Date.now() - started) / 1000), link: receipt.hash ? EXPLORER + receipt.hash : null });
     if (expectFail) {
       await chain.sleep(2_000);
       const stayed = unchanged ? await unchanged() : true;
       const detail = `exec=${receipt.executionOk} status=${receipt.status}${receipt.error ? ` error=${receipt.error}` : ''}`;
-      if (stayed) { check('PASS', `${label} (rejected, state unchanged)`, detail); return { ok: true, receipt }; }
-      check('FAIL', `${label} should have been rejected but state changed`, detail);
-      return { ok: false, receipt };
+      if (!stayed) { check('FAIL', `${label} should have been rejected but state changed`, detail); return { ok: false, receipt }; }
+      // "state unchanged" alone proves nothing (a call that never reached the chain also leaves state unchanged):
+      // the rejection counts only when a receipt with a hash shows the execution failed.
+      if (receipt.hash && receipt.executionOk === false) { check('PASS', `${label} (rejected, state unchanged)`, detail); return { ok: true, receipt }; }
+      if (receipt.hash && receipt.executionOk === true) { check('FAIL', `${label} executed successfully but should have been rejected`, detail); return { ok: false, receipt }; }
+      if (attempt < attempts) { check('WARN', `${label}: attempt ${attempt}/${attempts} gave no receipt, retrying to prove the rejection`, detail); await chain.sleep(5_000); continue; }
+      check('WARN', `${label}: state unchanged but the rejection could not be proven from a receipt`, detail);
+      return { ok: true, receipt };
     }
-    const ok = verify ? Boolean(await until(verify, 75_000)) : receipt.executionOk !== false;
+    const waitFailed = receipt.status === 'WAIT_ERROR';
+    const ok = verify ? Boolean(await until(verify, waitFailed ? 300_000 : 75_000)) : receipt.executionOk !== false && !waitFailed;
+    if (!ok && waitFailed) { check('FAIL', `${label}: sent (hash known) but the receipt could not be read`, `${receipt.hash} ${receipt.error ?? ''}`); return { ok: false, receipt }; }
     if (ok) {
       const note = attempt > 1 ? ` after ${attempt} attempts` : '';
       check(attempt > 1 ? 'WARN' : 'PASS', `${label}${note}`, `status=${receipt.status} exec=${receipt.executionOk} votes=${(receipt.votes ?? []).join('/') || 'n/a'}`);
@@ -131,7 +151,7 @@ async function tx(label, who, fn, args, opts = {}) {
   return { ok: false, receipt: null };
 }
 
-async function audit(label) {
+async function audit(label, { exact = true } = {}) {
   const s = await stats();
   const n = Number(s.rules); const m = Number(s.cases);
   let held = 0n; const people = Object.values(ACCTS);
@@ -146,14 +166,20 @@ async function audit(label) {
   held += claim;
   const okClaim = BigInt(s.claimable_total) === claim;
   const okEscrow = BigInt(s.escrow_total) === held;
-  let bal = null;
-  try { bal = await chain.balance(address); } catch (error) { bal = null; }
+  const readBal = async () => { try { return await chain.balance(address); } catch (error) { return null; } };
+  let bal = await readBal();
+  const escrow = BigInt(s.escrow_total);
   check(okClaim && okEscrow ? 'PASS' : 'FAIL', `audit ${label}: books balance`,
     `escrow=${s.escrow_total} recomputed=${held} claimable=${s.claimable_total}/${claim} contract_balance=${bal ?? 'unavailable'}`);
+  // withdraw() lowers escrow at once, but the network may debit the contract a little later: give it time,
+  // and accept a surplus only up to the value withdrawn so far. Anything beyond that is stranded value.
+  const withdrawnSoFar = WITHDRAWALS.reduce((a, w) => a + w.amount, 0n);
+  if (bal !== null && bal > escrow) await until(async () => { bal = await readBal(); return bal === null || bal <= escrow; }, withdrawnSoFar > 0n ? 90_000 : 15_000);
   if (bal === null) check('WARN', `audit ${label}: contract balance could not be read from the RPC`, 'native balance comparison skipped');
-  else if (bal < BigInt(s.escrow_total)) check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${bal} < escrow ${s.escrow_total}`);
-  else if (bal !== BigInt(s.escrow_total)) check('WARN', `audit ${label}: contract balance differs from escrow`, `balance ${bal}, escrow ${s.escrow_total} (pending finalization or value retained by a rejected call)`);
-  else check('PASS', `audit ${label}: contract balance equals escrow`, String(bal));
+  else if (bal < escrow) check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${bal} < escrow ${s.escrow_total}`);
+  else if (bal === escrow) check('PASS', `audit ${label}: contract balance equals escrow exactly`, String(bal));
+  else if (bal - escrow <= withdrawnSoFar) check('WARN', `audit ${label}: contract balance still above escrow by value already withdrawn`, `balance ${bal}, escrow ${s.escrow_total}, withdrawn so far ${withdrawnSoFar} (the network has not debited the transfer messages yet; re-checked after finalization)`);
+  else check('FAIL', `audit ${label}: contract balance differs from escrow`, `balance ${bal}, escrow ${s.escrow_total}, withdrawn so far ${withdrawnSoFar} (funds sit in the contract that no ledger entry owns)`);
   return { stats: s, rules, cases };
 }
 
@@ -201,6 +227,7 @@ async function setup() {
       throw new Abort(`${name} (${ACCTS[name].address}) holds only ${fmtGen(bal)}. Fund the five generated accounts, or export LITMUS_KEYS with five funded private keys, then rerun.`);
     }
   }
+  for (const name of names) START.set(ACCTS[name].address.toLowerCase(), await chain.balance(ACCTS[name].address));
   check('PASS', 'accounts created and funded', names.map((n) => `${n}=${ACCTS[n].address}`).join(' '));
 }
 
@@ -235,27 +262,27 @@ async function deploy() {
 }
 
 const forgeArgs = (o = {}) => {
-  const p = { title: 'Link etiquette', text: RULE_TEXT, aggs: AGGS, probes: PROBES, unit: UNIT, deposit: DEPOSIT, stake: STAKE, strikes: 3n, pass: 80n, defMin: WINDOW_MIN, appMin: WINDOW_MIN, ...o };
-  return [p.title, p.text, JSON.stringify(p.aggs), JSON.stringify(p.probes), p.unit, p.deposit, p.stake, p.strikes, p.pass, p.defMin, p.appMin];
+  const p = { title: 'Link etiquette', text: RULE_TEXT, aggs: AGGS, probes: PROBES, unit: UNIT, deposit: DEPOSIT, stake: STAKE, bond: BOND, strikes: 3n, pass: 80n, defMin: WINDOW_MIN, appMin: WINDOW_MIN, ...o };
+  return [p.title, p.text, JSON.stringify(p.aggs), JSON.stringify(p.probes), p.unit, p.deposit, p.stake, p.bond, p.strikes, p.pass, p.defMin, p.appMin];
 };
 
 async function forgeAndCertify() {
-  let before = null;
-  try { before = await chain.balance(address); } catch (error) { before = null; }
-  await tx('forge_rule rejects three probes', ACCTS.author, 'forge_rule', forgeArgs({ probes: PROBES.slice(0, 3) }), { value: BOND, expectFail: true, unchanged: async () => (await stats()).rules === 0 });
-  await tx('forge_rule rejects a bond below three penalty units', ACCTS.author, 'forge_rule', forgeArgs(), { value: 3n * UNIT - 1n, expectFail: true, unchanged: async () => (await stats()).rules === 0 });
-  await tx('forge_rule rejects a stake that cannot cover the maximum penalty', ACCTS.author, 'forge_rule', forgeArgs({ stake: 3n * UNIT - 1n }), { value: BOND, expectFail: true, unchanged: async () => (await stats()).rules === 0 });
-  let after = null;
-  try { after = await chain.balance(address); } catch (error) { after = null; }
-  if (before === null || after === null) check('INFO', 'value attached to rejected payable calls', 'contract balance unavailable from the RPC');
-  else check(after === before ? 'INFO' : 'WARN', 'value attached to rejected payable calls', after === before ? 'contract balance unchanged: rejected calls do not retain value' : `contract balance changed by ${after - before}: this network retains value of rejected calls`);
+  const noRules = async () => (await stats()).rules === 0;
+  await tx('forge_rule rejected while the author ledger is empty', ACCTS.author, 'forge_rule', forgeArgs(), { expectFail: true, unchanged: noRules });
+  await fundLedger(ACCTS.author, BOND, 'author bond');
+  const kept = async () => (await stats()).rules === 0 && (await claimable(ACCTS.author)) === BOND;
+  await tx('forge_rule rejects three probes', ACCTS.author, 'forge_rule', forgeArgs({ probes: PROBES.slice(0, 3) }), { expectFail: true, unchanged: kept });
+  await tx('forge_rule rejects a bond below three penalty units', ACCTS.author, 'forge_rule', forgeArgs({ bond: 3n * UNIT - 1n }), { expectFail: true, unchanged: kept });
+  await tx('forge_rule rejects a stake that cannot cover the maximum penalty', ACCTS.author, 'forge_rule', forgeArgs({ stake: 3n * UNIT - 1n }), { expectFail: true, unchanged: kept });
+  await audit('after rejected forges (nothing may be stranded)');
 
-  const forged = await tx('forge_rule (main rule)', ACCTS.author, 'forge_rule', forgeArgs(), { value: BOND, verify: async () => (await stats()).rules === 1 });
+  const forged = await tx('forge_rule (main rule)', ACCTS.author, 'forge_rule', forgeArgs(), { verify: async () => (await stats()).rules === 1 });
   if (!forged.ok) throw new Abort('rule could not be forged');
   const r = await rule(1);
   assertEq('rule status is DRAFT', r.status, 'DRAFT');
   assertEq('rule author', r.author, wallet(ACCTS.author));
   assertEq('bond escrowed exactly', r.bond_remaining, BOND);
+  assertEq('author ledger spent exactly the bond', await claimable(ACCTS.author), 0n);
   assertEq('probes start pending', r.probes.map((p) => p.result).join(','), 'PENDING,PENDING,PENDING,PENDING,PENDING');
   await tx('run_probe rejected for a non-author', ACCTS.outsider, 'run_probe', [1n, 0n], { expectFail: true, unchanged: async () => (await rule(1)).probes_run === 0 });
   await tx('certify_rule rejected before every probe ran', ACCTS.author, 'certify_rule', [1n], { expectFail: true, unchanged: async () => (await rule(1)).status === 'DRAFT' });
@@ -283,19 +310,26 @@ async function forgeAndCertify() {
 }
 
 async function enlistMembers() {
-  await tx('enlist rejected with a stake that is one wei short', ACCTS.plaintiff, 'enlist', [1n], { value: STAKE - 1n, expectFail: true, unchanged: async () => (await member(1, ACCTS.plaintiff)) === null });
+  await fundLedger(ACCTS.outsider, STAKE - 1n, 'outsider (one wei short of a stake)');
+  await tx('enlist rejected with a ledger one wei short of the stake', ACCTS.outsider, 'enlist', [1n], { expectFail: true, unchanged: async () => (await member(1, ACCTS.outsider)) === null && (await claimable(ACCTS.outsider)) === STAKE - 1n });
   for (const name of ['plaintiff', 'defendant', 'observer']) {
-    await tx(`enlist ${name}`, ACCTS[name], 'enlist', [1n], { value: STAKE, verify: async () => (await member(1, ACCTS[name]))?.status === 'ACTIVE' });
+    await fundLedger(ACCTS[name], STAKE, `${name} stake`);
+    await tx(`enlist ${name}`, ACCTS[name], 'enlist', [1n], { verify: async () => (await member(1, ACCTS[name]))?.status === 'ACTIVE' });
     assertEq(`${name} stake escrowed`, (await member(1, ACCTS[name])).stake, STAKE);
+    assertEq(`${name} ledger spent exactly the stake`, await claimable(ACCTS[name]), 0n);
   }
-  await tx('enlist twice rejected', ACCTS.plaintiff, 'enlist', [1n], { value: STAKE, expectFail: true, unchanged: async () => (await rule(1)).members === 3 });
+  await fundLedger(ACCTS.plaintiff, STAKE, 'plaintiff (to prove a rejected enlist keeps the ledger)');
+  await tx('enlist twice rejected, ledger untouched', ACCTS.plaintiff, 'enlist', [1n], { expectFail: true, unchanged: async () => (await rule(1)).members === 3 && (await claimable(ACCTS.plaintiff)) === STAKE });
   assertEq('rule counts three active members', (await rule(1)).members, 3);
+  const casesNow = (await stats()).cases;
+  await tx('file_case rejected while the plaintiff ledger is empty', ACCTS.observer, 'file_case', [1n, wallet(ACCTS.defendant), CASES.A.statement], { expectFail: true, unchanged: async () => (await stats()).cases === casesNow });
   await audit('after enlist');
 }
 
 async function fileCase(spec, plaintiff, defendant) {
   const before = (await stats()).cases;
-  const res = await tx(`file_case ${spec.name}`, plaintiff, 'file_case', [1n, wallet(defendant), spec.statement], { value: DEPOSIT, verify: async () => (await stats()).cases === before + 1 });
+  await fundLedger(plaintiff, DEPOSIT, `case ${spec.name} filing deposit`);
+  const res = await tx(`file_case ${spec.name}`, plaintiff, 'file_case', [1n, wallet(defendant), spec.statement], { verify: async () => (await stats()).cases === before + 1 });
   if (!res.ok) throw new Abort(`case ${spec.name} could not be filed`);
   const id = (await stats()).cases;
   const c = await kase(id);
@@ -308,9 +342,8 @@ async function runCase(name, plaintiff, defendant, { appeal = false, negativeChe
   if (negativeChecks) {
     const casesBefore = (await stats()).cases;
     const same = async () => (await stats()).cases === casesBefore;
-    await tx('file_case rejected with the wrong deposit', plaintiff, 'file_case', [1n, wallet(defendant), spec.statement], { value: DEPOSIT - 1n, expectFail: true, unchanged: same });
-    await tx('file_case rejected against oneself', plaintiff, 'file_case', [1n, wallet(plaintiff), spec.statement], { value: DEPOSIT, expectFail: true, unchanged: same });
-    await tx('file_case rejected for a non-member defendant', plaintiff, 'file_case', [1n, wallet(ACCTS.outsider), spec.statement], { value: DEPOSIT, expectFail: true, unchanged: same });
+    await tx('file_case rejected against oneself', plaintiff, 'file_case', [1n, wallet(plaintiff), spec.statement], { expectFail: true, unchanged: same });
+    await tx('file_case rejected for a non-member defendant', plaintiff, 'file_case', [1n, wallet(ACCTS.outsider), spec.statement], { expectFail: true, unchanged: same });
   }
   const cid = await fileCase(spec, plaintiff, defendant);
   const dBefore = await member(1, defendant);
@@ -331,15 +364,16 @@ async function runCase(name, plaintiff, defendant, { appeal = false, negativeChe
   const otherAcct = appellantAcct === defendant ? plaintiff : defendant;
   report.notes.push(`case ${name}: id ${cid}, ruled ${ruled.verdict} ${JSON.stringify(ruled.factors)}`);
 
-  // snapshot right before settlement
+  // Snapshot right after the ruling and BEFORE the appeal deposit is funded: funding (+D) and the debit (-D) cancel,
+  // so every later ledger delta equals exactly the credits the settlement produced.
   const r0 = await rule(1);
   const pre = { rule: r0, pm: await member(1, plaintiff), dm: await member(1, defendant), cl: new Map() };
   for (const w of [plaintiff, defendant]) pre.cl.set(wallet(w), await claimable(w));
 
   if (appeal) {
-    await tx(`appeal_case ${name} rejected for the party that won`, otherAcct, 'appeal_case', [BigInt(cid), 'The winning party must not appeal this ruling.'], { value: DEPOSIT, expectFail: true, unchanged: async () => (await kase(cid)).status === 'RULED' });
-    await tx(`appeal_case ${name} rejected with the wrong deposit`, appellantAcct, 'appeal_case', [BigInt(cid), CASES[name].grounds], { value: DEPOSIT - 1n, expectFail: true, unchanged: async () => (await kase(cid)).status === 'RULED' });
-    await tx(`appeal_case ${name} (model, exact consensus)`, appellantAcct, 'appeal_case', [BigInt(cid), CASES[name].grounds], { value: DEPOSIT, kind: 'llm', verify: async () => (await kase(cid)).status === 'SETTLED' });
+    await tx(`appeal_case ${name} rejected for the party that won`, otherAcct, 'appeal_case', [BigInt(cid), 'The winning party must not appeal this ruling.'], { expectFail: true, unchanged: async () => (await kase(cid)).status === 'RULED' });
+    await fundLedger(appellantAcct, DEPOSIT, `case ${name} appeal deposit`);
+    await tx(`appeal_case ${name} (model, exact consensus)`, appellantAcct, 'appeal_case', [BigInt(cid), CASES[name].grounds], { kind: 'llm', verify: async () => (await kase(cid)).status === 'SETTLED' });
   } else {
     await tx(`settle_case ${name} rejected while the appeal window is open`, ACCTS.observer, 'settle_case', [BigInt(cid)], { expectFail: true, unchanged: async () => (await kase(cid)).status === 'RULED' });
     await tx(`waive_appeal ${name} rejected for the winning party`, otherAcct, 'waive_appeal', [BigInt(cid)], { expectFail: true, unchanged: async () => (await kase(cid)).waived === false });
@@ -417,37 +451,97 @@ async function exitFlow() {
   }
   await tx('reclaim_bond rejected before retirement', ACCTS.author, 'reclaim_bond', [1n], { expectFail: true, unchanged: async () => (await rule(1)).bond_remaining !== '0' });
   await tx('retire_rule', ACCTS.author, 'retire_rule', [1n], { verify: async () => (await rule(1)).status === 'RETIRED' });
-  await tx('enlist rejected on a retired rule', ACCTS.outsider, 'enlist', [1n], { value: STAKE, expectFail: true, unchanged: async () => (await member(1, ACCTS.outsider)) === null });
+  await fundLedger(ACCTS.outsider, 1n, 'outsider (completes a full stake)');
+  await tx('enlist rejected on a retired rule, ledger untouched', ACCTS.outsider, 'enlist', [1n], { expectFail: true, unchanged: async () => (await member(1, ACCTS.outsider)) === null && (await claimable(ACCTS.outsider)) === STAKE });
   const remaining = BigInt((await rule(1)).bond_remaining); const beforeBond = await claimable(ACCTS.author);
   await tx('reclaim_bond', ACCTS.author, 'reclaim_bond', [1n], { verify: async () => (await rule(1)).bond_remaining === '0' });
   assertEq('bond remainder credited to the author', (await claimable(ACCTS.author)) - beforeBond, remaining);
   await audit('before withdrawals');
 }
 
+const WITHDRAWALS = [];
+
+/** Withdraws the whole ledger balance and inspects the transfer message the contract emitted for it. */
+async function withdrawNow(name, acct, label = 'withdraw') {
+  const amount = await claimable(acct);
+  if (amount === 0n) return null;
+  const balBefore = await chain.balance(acct.address);
+  const res = await tx(`${label} ${name} (${fmtGen(amount)})`, acct, 'withdraw', [], { verify: async () => (await claimable(acct)) === 0n });
+  assertEq(`${name} ledger cleared`, await claimable(acct), 0n);
+  if (!res.ok) return null;
+  const w = { name, acct, amount, balBefore, hash: res.receipt.hash, at: chain.now(), child: null };
+  WITHDRAWALS.push(w);
+  WITHDRAWN.set(acct.address.toLowerCase(), (WITHDRAWN.get(acct.address.toLowerCase()) ?? 0n) + amount);
+  await inspectTransfer(w);
+  return w;
+}
+
+/** The contract's balance drops when it emits the transfer; the child transaction shows where it went. */
+async function inspectTransfer(w) {
+  if (!w.hash || typeof chain.triggered !== 'function') return;
+  try {
+    if ((await chain.triggered(w.hash)) === null) { check('INFO', `${w.name}: child-transaction lookup is not supported by this genlayer-js build`, 'transfer inspection skipped; the wallet reconciliation below still covers it'); return; }
+    const kids = await eventually(async () => { const k = await chain.triggered(w.hash); return k && k.length ? k : false; }, { timeoutMs: 90_000, intervalMs: 5_000, sleep: (ms) => chain.sleep(ms), now: () => chain.now() });
+    if (!kids) { check('WARN', `${w.name}: withdraw produced no child transaction`, 'no emitted transfer message is visible for this transaction yet'); return; }
+    const same = (k) => String(k.to).toLowerCase() === wallet(w.acct) && (() => { try { return BigInt(k.value) === w.amount; } catch { return String(k.value) === String(w.amount); } })();
+    const match = kids.find(same);
+    w.child = match?.id ?? null;
+    check(match ? 'PASS' : 'WARN', `${w.name}: withdraw emitted a transfer message to the wallet for the exact amount`,
+      match ? `child ${match.id} status ${match.status} value ${match.value}` : `children seen: ${JSON.stringify(kids).slice(0, 300)}`);
+  } catch (error) { check('WARN', `${w.name}: transfer message could not be inspected`, String(error?.shortMessage ?? error?.message ?? error).slice(0, 160)); }
+}
+
 async function withdrawAll() {
-  const pending = [];
-  for (const [name, acct] of Object.entries(ACCTS)) {
-    const amount = await claimable(acct);
-    if (amount === 0n) continue;
-    const balBefore = await chain.balance(acct.address);
-    const res = await tx(`withdraw ${name} (${fmtGen(amount)})`, acct, 'withdraw', [], { verify: async () => (await claimable(acct)) === 0n });
-    assertEq(`${name} ledger cleared`, await claimable(acct), 0n);
-    if (res.ok) pending.push({ name, acct, amount, balBefore, hash: res.receipt.hash });
-  }
+  for (const [name, acct] of Object.entries(ACCTS)) await withdrawNow(name, acct);
   await tx('withdraw rejected when nothing is owed', ACCTS.outsider, 'withdraw', [], { expectFail: true, unchanged: async () => true });
-  for (const p of pending) {
-    if (p.hash) await chain.waitFinalized(p.hash, FINALITY_MIN * 60_000);
-    const credited = await until(async () => (await chain.balance(p.acct.address)) >= p.balBefore + p.amount, 120_000);
-    const now = await chain.balance(p.acct.address);
-    check(credited ? 'PASS' : 'WARN', `${p.name}: wallet balance received the withdrawal`, credited ? `+${now - p.balBefore} wei` : `expected +${p.amount} wei, saw +${now - p.balBefore} wei after finalization wait (transfers land on finalization)`);
-  }
   const s = await stats();
   assertEq('escrow is zero after full wind-down', s.escrow_total, 0);
   assertEq('claimable is zero after full wind-down', s.claimable_total, 0);
   try {
-    const zero = await until(async () => (await chain.balance(address)) === 0n, 120_000);
-    check(zero ? 'PASS' : 'WARN', 'contract balance is zero after full wind-down', `balance ${await chain.balance(address)}`);
+    let bal = await chain.balance(address);
+    if (bal !== 0n) await until(async () => { bal = await chain.balance(address); return bal === 0n; }, 120_000);
+    check(bal === 0n ? 'PASS' : 'WARN', 'contract balance is zero after the last withdrawal', bal === 0n ? 'debited at execution' : `balance ${bal} still in the contract; re-checked after finalization below`);
   } catch (error) { check('WARN', 'contract balance could not be read after wind-down', String(error?.message ?? error).slice(0, 120)); }
+  await finalizeWithdrawals();
+  try {
+    const finalBal = await chain.balance(address);
+    check(finalBal === 0n ? 'PASS' : 'FAIL', 'contract balance is zero once every withdrawal has finalized', finalBal === 0n ? '0' : `balance ${finalBal} remains although escrow is 0 (stranded value)`);
+  } catch (error) { check('WARN', 'contract balance could not be read after finalization', String(error?.message ?? error).slice(0, 120)); }
+  await reconcileWallets();
+}
+
+/** Waits for the withdraw transactions to finalize (messages marked 'finalized' execute then) and reports it. */
+async function finalizeWithdrawals() {
+  if (!WITHDRAWALS.length) return;
+  const deadline = Math.max(...WITHDRAWALS.map((w) => w.at)) + FINALITY_MIN * 60_000;
+  for (const w of WITHDRAWALS) {
+    const remaining = Math.max(30_000, deadline - chain.now());
+    console.log(`      ... waiting up to ${Math.round(remaining / 60_000)} min for the withdraw of ${w.name} to finalize`);
+    const done = await chain.waitFinalized(w.hash, remaining);
+    const childStatus = w.child ? await chain.txStatus(w.child) : 'n/a';
+    check(done.status === 'FINALIZED' ? 'PASS' : 'WARN', `${w.name}: withdraw transaction finalization`, `status ${done.status} after ${done.waitedSec}s of waiting; child transfer status ${childStatus}`);
+  }
+}
+
+/** start - value sent + value withdrawn must equal the final wallet balance (any gap is reported, never hidden). */
+async function reconcileWallets() {
+  const rows = async () => {
+    const out = [];
+    for (const [name, acct] of Object.entries(ACCTS)) {
+      const key = acct.address.toLowerCase();
+      const start = START.get(key); const sent = SENT.get(key) ?? 0n; const got = WITHDRAWN.get(key) ?? 0n;
+      const actual = await chain.balance(acct.address);
+      out.push({ name, start, sent, got, actual, expected: start - sent + got });
+    }
+    return out;
+  };
+  await until(async () => (await rows()).every((r) => r.actual === r.expected), 120_000);
+  for (const r of await rows()) {
+    const detail = `start ${r.start} - sent ${r.sent} + withdrawn ${r.got} = expected ${r.expected}; actual ${r.actual}; gap ${r.actual - r.expected}`;
+    if (r.actual === r.expected) check('PASS', `wallet reconciliation ${r.name}`, detail);
+    else if (r.got > 0n && r.actual === r.start - r.sent) check('WARN', `wallet reconciliation ${r.name}: the withdrawal has not arrived`, `${detail}. The contract emitted the transfer (its balance dropped) but the wallet balance did not rise.`);
+    else check('WARN', `wallet reconciliation ${r.name}`, `${detail} (network fees or pending transfers)`);
+  }
 }
 
 // ------------------------------------------------------------------------------------------ main
@@ -487,7 +581,9 @@ async function main() {
     await enlistMembers();
     if (!SKIP_SLOW) timeoutCase = await timeoutCaseStart(); else check('SKIP', 'timeout case T (two waiting windows)', '--skip-slow');
     await runCase('A', ACCTS.plaintiff, ACCTS.defendant, { negativeChecks: true });
+    await withdrawNow('plaintiff', ACCTS.plaintiff, 'early withdraw');   // finality overlaps the remaining cases
     await runCase('B', ACCTS.plaintiff, ACCTS.defendant);
+    await withdrawNow('defendant', ACCTS.defendant, 'early withdraw');
     await runCase('C', ACCTS.plaintiff, ACCTS.defendant, { appeal: true });
     if (timeoutCase) await timeoutCaseFinish(timeoutCase);
     await exitFlow();

@@ -67,10 +67,12 @@ def test_random_walk_keeps_books_balanced(world, seed):
         n = 2
         ok = False
         if op == "forge" and rules < 6 and (not live or rng.random() < 0.3):
+            bond = rng.choice([3000, 6000])
+            try_call(w, who, "deposit", value=bond + rng.choice([0, 0, 0, -1, 1]))
             ok = try_call(w, who, "forge_rule", "Fuzz rule title", "Fuzz rule: members must not do the forbidden thing.",
                           json.dumps(["Aggravating circumstance one holds.", "Aggravating circumstance two holds."]),
-                          json.dumps(PROBES), 1000, 100, rng.choice([6000, 9000]), rng.randint(1, 3),
-                          rng.choice([75, 100]), 2, 2, value=rng.choice([3000, 6000]))
+                          json.dumps(PROBES), 1000, 100, rng.choice([6000, 9000]), bond, rng.randint(1, 3),
+                          rng.choice([75, 100]), 2, 2)
         elif op == "probe":
             index = rng.randrange(4)
             truth = PROBES[index]
@@ -80,14 +82,15 @@ def test_random_walk_keeps_books_balanced(world, seed):
         elif op == "certify":
             ok = try_call(w, pick_actor(rng, w, who, author_index(w, rid)), "certify_rule", rid)
         elif op == "enlist":
-            ok = try_call(w, who, "enlist", rid, value=int(w.rule(rid)["enlist_stake"]) + rng.choice([0, 0, 0, 1]))
+            try_call(w, who, "deposit", value=int(w.rule(rid)["enlist_stake"]) + rng.choice([0, 0, 0, -1, 1]))
+            ok = try_call(w, who, "enlist", rid)
         elif op == "leave" and rng.random() < 0.25:
             ok = try_call(w, who, "leave", rid)
         elif op == "file":
             plaintiff = rng.choice([1, 2, 3, 4]) if rng.random() < 0.85 else who
             defendant = rng.choice([1, 2, 3, 4])
-            ok = try_call(w, plaintiff, "file_case", rid, w.w(defendant), "A statement about what happened here.",
-                          value=DEPOSIT + rng.choice([0, 0, 0, 5]))
+            try_call(w, plaintiff, "deposit", value=DEPOSIT + rng.choice([0, 0, 0, -1, 5]))
+            ok = try_call(w, plaintiff, "file_case", rid, w.w(defendant), "A statement about what happened here.")
         elif op == "defense" and case:
             ok = try_call(w, pick_actor(rng, w, who, idx(w, case["defendant"])), "submit_defense", cid,
                           "A concrete defense with facts of its own.")
@@ -100,8 +103,9 @@ def test_random_walk_keeps_books_balanced(world, seed):
         elif op == "appeal" and case:
             party = case["defendant"] if case["verdict"] == "BREACH" else case["plaintiff"]
             llm(w.vm, (r"LITMUS", random_ruling(rng, n)))
-            ok = try_call(w, pick_actor(rng, w, who, idx(w, party)), "appeal_case", cid,
-                          "Grounds for the appeal are stated here.", value=DEPOSIT)
+            actor = pick_actor(rng, w, who, idx(w, party))
+            try_call(w, actor, "deposit", value=DEPOSIT + rng.choice([0, 0, -1]))
+            ok = try_call(w, actor, "appeal_case", cid, "Grounds for the appeal are stated here.")
         elif op == "settle" and case:
             ok = try_call(w, who, "settle_case", cid)
         elif op == "withdraw":

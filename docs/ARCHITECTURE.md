@@ -11,9 +11,9 @@ Single contract, `Litmus` (`contracts/Litmus.py`), GenVM v0.2.16, runner
 | `rules` | `TreeMap[u32, str]` | JSON rule records |
 | `cases` | `TreeMap[u32, str]` | JSON case records |
 | `members` | `TreeMap[str, str]` | key `"<rule_id>:<wallet>"`, JSON member records |
-| `claimable` | `TreeMap[str, u256]` | pull-ledger per lower-case wallet |
-| `escrow_total` | `u256` | everything the contract holds for others |
-| `claimable_total` | `u256` | the part of `escrow_total` already owed to wallets |
+| `claimable` | `TreeMap[str, u256]` | the **ledger**: each lower-case wallet's spendable and withdrawable balance |
+| `escrow_total` | `u256` | everything the contract holds for others (value in via `deposit()`, out via `withdraw()`) |
+| `claimable_total` | `u256` | the part of `escrow_total` that sits in wallet ledgers |
 
 Money inside records is a **decimal string** so no client ever loses precision.
 
@@ -47,8 +47,9 @@ appeal (by, grounds, deposit, second ruling), final (verdict incl. `VOID`, facto
   is released at settlement, so a penalty is never partial.
 * `bond >= 3 x penalty_unit`. Each favourable appeal slashes `min(penalty_unit, bond_remaining)` to the
   appellant. The remainder is reclaimable after retirement once no case is open.
-* Payable calls take an **exact** value (`enlist`, `file_case`, `appeal_case`). `forge_rule` takes any value
-  at or above the minimum bond.
+* Only `deposit()` is payable. `forge_rule`, `enlist`, `file_case` and `appeal_case` are non-payable and
+  **debit the exact amount from the caller's ledger** (`insufficient ledger balance` otherwise). Nothing is
+  charged by a rejected call, and the escrow identity is unchanged: debits move value between buckets.
 
 ## Timing
 
@@ -62,6 +63,14 @@ is still OPEN. The windows are fixed per rule at forge time (2 minutes to 7 days
 The appellant is the **adversely affected party**: the defendant after a BREACH ruling, the plaintiff after
 COMPLIANT or INCONCLUSIVE. Only they can `waive_appeal` or `appeal_case`. Everything else that only depends
 on time or on already agreed data is permissionless.
+
+## Why only `deposit()` takes value
+
+A rejected call keeps the native value attached to it (observed on Studionet), and a contract cannot refund
+inside a call that reverts. Every payable method that can reject therefore strands funds, and a payable
+method that runs a nondeterministic step (an appeal) can also fail by lack of validator agreement. `deposit()`
+has a single refusal, `value == 0`, evaluated before anything is touched; every other method spends ledger
+balance and attaches no value.
 
 ## Withdrawals
 

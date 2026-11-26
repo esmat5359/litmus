@@ -34,7 +34,7 @@ How the code enforces it (details in [docs/CONSENSUS.md](docs/CONSENSUS.md)):
 * a leader answer must already be in canonical form (exact key set, upper-case enum, real booleans, right
   number of flags, flags only on BREACH); a validator never repairs it;
 * `reason` is bounded free text and never decides anything;
-* the law is locked by an **exhaustive equality matrix**, **20 mutation tests** (tolerances, one-step
+* the law is locked by an **exhaustive equality matrix**, **26 mutation tests** (tolerances, one-step
   acceptance, adjacent verdicts, skipped checks ...) and **AST guards** that fail if the validator ever uses
   `abs`, ordering comparisons, counting or arithmetic.
 
@@ -68,13 +68,25 @@ fully collectable and never partial.
 
 | Write | Who | Notes |
 |---|---|---|
-| `forge_rule(title, text, aggravators_json, probes_json, penalty_unit, filing_deposit, enlist_stake, strike_limit, pass_percent, defense_minutes, appeal_minutes)` payable | anyone | attached value = author bond (>= 3 penalty units) |
+| **`deposit()` payable** | anyone | the **only** call that accepts value; credits the caller's ledger balance |
+| `forge_rule(title, text, aggravators_json, probes_json, penalty_unit, filing_deposit, enlist_stake, bond, strike_limit, pass_percent, defense_minutes, appeal_minutes)` | anyone | spends `bond` (>= 3 penalty units) from the ledger |
 | `revise_rule`, `run_probe`, `certify_rule`, `retire_rule`, `reclaim_bond` | author | probes run once per version; max 2 revisions |
-| `enlist` payable, `leave` | member | exact stake; re-enlist keeps strikes; expelled members can only leave |
-| `file_case` payable, `submit_defense` | member / defendant | at most 3 open cases per member |
+| `enlist`, `leave` | member | spends the exact stake from the ledger; re-enlist keeps strikes; expelled members can only leave |
+| `file_case`, `submit_defense` | member / defendant | spends the filing deposit; at most 3 open cases per member |
 | `rule_case`, `settle_case`, `void_case` | anyone | permissionless once the clock allows |
-| `waive_appeal`, `appeal_case` payable | the adversely affected party | appeal = fresh judgement without seeing the first ruling |
-| `withdraw` | anyone owed money | pull-payment; ledger zeroed before the transfer is emitted |
+| `waive_appeal`, `appeal_case` | the adversely affected party | spends the appeal deposit; fresh judgement without seeing the first ruling |
+| `withdraw` | anyone with a ledger balance | pull-payment; ledger zeroed before the transfer is emitted |
+
+### Funding model: deposit first
+
+Native value enters the contract **only** through `deposit()`. Winnings, released stakes and reclaimed bonds
+land on the same ledger, so they can fund the next action without a round trip through a wallet.
+
+This is not a style choice. The first live Studionet run proved that **a rejected call keeps the value that
+was attached to it** (nine rejected calls stranded exactly 0.0425 GEN, to the wei), and a contract cannot
+refund inside a call that reverts. With deposit-first, the only call that carries value cannot fail once
+value is attached, and every other call carries none, so a mistake costs nothing. A static guard fails the
+build if any other method ever becomes payable.
 
 Views: `get_stats`, `get_limits`, `get_rule`, `list_rules`, `get_case`, `list_cases`, `get_member`,
 `get_claimable`. Amounts are returned as decimal strings, so JavaScript clients never lose wei precision.
@@ -97,8 +109,8 @@ points `GENVMROOT` at it, so the linter and Direct Mode use the real v0.2.16 SDK
 ### Live end-to-end run on Studionet (GitHub Codespaces friendly)
 
 ```bash
-node scripts/live_e2e.mjs                 # full run, deploys a fresh contract, writes reports/*.md and *.json
-node scripts/live_e2e.mjs --skip-slow     # skip the two-window timeout case (saves ~8 minutes)
+node scripts/live_e2e.mjs                 # full run (45-90 minutes on the public RPC), deploys a fresh contract, writes reports/*.md and *.json
+node scripts/live_e2e.mjs --skip-slow     # skip the two-window timeout case (saves a few minutes)
 node scripts/live_e2e.mjs --dry-run       # same script, no network, in-process model
 ```
 
@@ -113,25 +125,41 @@ verified against **contract state**, language-model steps are retried and report
 | Gate | Result |
 |---|---|
 | `genvm-lint check` against the v0.2.16 runner | passes (24 methods: 8 views, 16 writes) |
-| Direct Mode suite (real v0.2.16 SDK) | 139 tests: lifecycle, validation, payouts, appeals, expulsion, liveness escape, closures pickle like on the real VM |
+| Direct Mode suite (real v0.2.16 SDK) | 165 tests: lifecycle, validation, payouts, appeals, expulsion, liveness escape, funding model, closures pickle like on the real VM |
 | Exact-equality matrix | every (leader, validator) pair of every state for 0-3 factors in PROBE, CASE and APPEAL mode |
-| Mutation tests | 20 deliberately broken contracts, all killed (tolerance, one-step, adjacent verdicts, accounting faults) |
+| Mutation tests | 26 deliberately broken contracts, all killed (tolerance, one-step, adjacent verdicts, accounting and funding faults) |
 | Seeded random walks | 10 walks x 600 steps, books re-audited after every successful call, every outcome reached |
 | Differential replay | the live script's model and accounting oracle replayed on the real Python contract: identical final state |
-| Static guards | validator uses `==` only; one model call site; no storage or time inside the nondeterministic block |
+| Static guards | validator uses `==` only; one model call site; no storage or time inside the nondeterministic block; only `deposit()` is payable |
 
-**Honest limit:** the authoring environment could not reach `studio.genlayer.com`, so the live script was
-exercised against the in-process model and then replayed on the real contract, not against the public
-network. Because every check reads contract state rather than trusting receipt field names, the first real
-run is expected to work; if a receipt field differs, the report shows it as a warning with the raw status.
+### First live Studionet run (2026-11-18)
+
+162 checks passed, 0 failed. The validators agreed on **every** model-backed call on the first attempt: all
+five golden probes, all four case rulings (including a BREACH with both aggravating factors) and the appeal,
+each with the designed verdict and flags, so the exact-equality law is workable on the real network with
+these concrete rules. Contract bytes, rule digest (computed independently in JavaScript), every payout, every
+reservation and every counter matched the independent accounting oracle, and a defendant was expelled at the
+third strike. The run also found three things, now fixed or instrumented:
+
+| Finding | Evidence | Resolution |
+|---|---|---|
+| Rejected calls keep their attached value | contract balance exceeded escrow by exactly the sum of nine rejected calls | deposit-first funding model (above); audits now demand balance == escrow exactly |
+| The public RPC allows 30 requests per minute | `Rate limit exceeded` and HTML error pages; one receipt poll failed after the transaction had landed | one throttled request queue, retries of rate-limit answers, and a rule that a known transaction hash is never resubmitted |
+| Withdrawn funds were not seen arriving in the wallets | the contract balance fell by exactly the withdrawn total, wallet balances read +0 | the script now reconciles every wallet (start - sent + withdrawn) and reports the exact gap; see Known limits |
 
 ## Known limits (by design)
 
 * **Exact equality costs liveness.** If the validators cannot agree on a vague statement the call fails and
   can be retried; a case that never reaches a quorum can be voided after 7 days. Write concrete rules and
   concrete probes: the clarity gate exists to teach exactly that.
-* Native-token transfers are emitted **on finalization**; `withdraw` therefore credits the wallet after the
-  transaction finalizes, not at acceptance.
+* Native-token transfers are emitted **on finalization** (the SDK default). In the first live run the contract
+  balance dropped by exactly the withdrawn amount, but the wallet balances had not risen when the run ended
+  (that run's finalization wait could be cut short by any RPC error, and the whole run took 32 minutes, so it cannot have waited the 4 x 10 minutes it was configured for). The script
+  now withdraws early, reads back each emitted transfer message, waits for finalization with a polling loop
+  that no transient RPC error can cut short, and reconciles every wallet; `scripts/check_balances.mjs`
+  answers the same question for a run that is already over.
+* Do not send value to the contract by any means other than `deposit()`: a plain transfer cannot be
+  recovered (the pinned linter does not accept a `__receive__` handler).
 * The contract trusts the model only for the closed form described above; it does not fetch web pages. The
   evidence is the text parties submit on-chain.
 * One appeal per case; appeals do not chain.

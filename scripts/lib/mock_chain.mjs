@@ -10,6 +10,7 @@ const BASE_TS = 1793534400;
 
 class Revert extends Error {}
 const need = (cond, msg) => { if (!cond) throw new Revert(msg); };
+const need0 = (cond, msg) => { if (!cond) throw new Error(msg); };
 
 function bounded(v, lo, hi, label) {
   need(typeof v === 'string', `invalid ${label}`);
@@ -112,7 +113,9 @@ export class MockChain {
     this.txCounter += 1;
     return { hash: '0x' + createHash('sha256').update(String(this.txCounter)).digest('hex'), status: 'ACCEPTED', executionOk: ok, error, votes: ['AGREE', 'AGREE', 'AGREE', 'AGREE', 'AGREE'], resultName: 'AGREE', contractAddress: null };
   }
-  async waitFinalized(hash) { this.clockMs += 30_000; this.flushTransfers(); return { hash, status: 'FINALIZED', executionOk: true, error: null, votes: [] }; }
+  async waitFinalized(hash) { this.clockMs += 30_000; this.flushTransfers(); return { hash, status: 'FINALIZED', waitedSec: 30, timedOut: false }; }
+  async txStatus() { return 'FINALIZED'; }
+  async triggered(hash) { const t = this.transfersByHash?.[hash]; return t ? [{ id: '0x' + createHash('sha256').update(hash + 'child').digest('hex'), status: 'FINALIZED', to: t.to, value: t.value, type: 'send' }] : []; }
   async contractCode() { return this.code; }
   async read(address, fn, args = []) { return this.view(fn, args); }
 
@@ -121,25 +124,24 @@ export class MockChain {
     this.clockMs += llmFns.has(fn) ? 45_000 : 18_000;
     this.flushTransfers();
     const snapshot = clone(this.state);
-    const balances = new Map(this.balances);
-    const contractBalance = this.contractBalance;
     const entry = { t: this.nowSec(), from: acct.address, fn, args: args.map((a) => (typeof a === 'bigint' ? { $big: a.toString() } : a)), value: String(value), llm: null, ok: true };
+    const attached = BigInt(value);
+    if (attached > 0n) need0((this.balances.get(acct.address) ?? 0n) >= attached, 'insufficient funds');
+    // Like the real network: the attached value moves to the contract even when the call is rejected.
+    if (attached > 0n) { this.balances.set(acct.address, this.balances.get(acct.address) - attached); this.contractBalance += attached; }
+    const contractBefore = this.contractBalance;
     try {
-      const ctx = { sender: acct.address, value: BigInt(value), now: this.nowSec(), entry };
-      if (ctx.value > 0n) {
-        need((this.balances.get(acct.address) ?? 0n) >= ctx.value, 'insufficient funds');
-      }
+      const ctx = { sender: acct.address, value: attached, now: this.nowSec(), entry };
       this.exec(ctx, fn, args);
-      if (ctx.value > 0n) { this.balances.set(acct.address, this.balances.get(acct.address) - ctx.value); this.contractBalance += ctx.value; }
       this.transcript.push(entry);
-      return this.receipt(true, null);
+      const done = this.receipt(true, null);
+      if (entry.transfer) { this.transfersByHash = this.transfersByHash ?? {}; this.transfersByHash[done.hash] = { to: acct.address, value: entry.transfer }; }
+      return done;
     } catch (error) {
       if (!(error instanceof Revert)) throw error;
       this.state = snapshot;
-      this.balances = balances;
-      this.contractBalance = contractBalance;
+      this.contractBalance = contractBefore;
       entry.ok = false;
-      entry.llm = entry.llm;
       this.transcript.push(entry);
       return this.receipt(false, error.message);
     }
@@ -151,11 +153,11 @@ export class MockChain {
   kase(id) { const c = this.S.cases[id]; need(c, 'case not found'); return c; }
   member(rid, w) { return this.S.members[`${rid}:${w}`] ?? null; }
   credit(w, amt) { amt = BigInt(amt); if (amt <= 0n) return; this.S.claimable[w] = (this.S.claimable[w] ?? 0n) + amt; this.S.claimableTotal += amt; }
-  receive(ctx, { exact = null, minimum = null } = {}) {
-    if (exact !== null) need(ctx.value === exact, 'value must equal');
-    if (minimum !== null) need(ctx.value >= minimum, 'value below minimum');
-    this.S.escrow += ctx.value;
-    return ctx.value;
+  balanceOf(w) { return this.S.claimable[w] ?? 0n; }
+  debit(w, amt) {
+    amt = BigInt(amt); const bal = this.balanceOf(w);
+    need(bal >= amt, 'insufficient ledger balance');
+    this.S.claimable[w] = bal - amt; this.S.claimableTotal -= amt;
   }
   onlyAuthor(ctx, rule) { need(ctx.sender === rule.author, 'only the rule author'); }
   maxPenalty(rule) { return BigInt(rule.penalty_unit) * BigInt(1 + rule.aggravators.length); }
@@ -169,7 +171,7 @@ export class MockChain {
     const S = this.S;
     switch (fn) {
       case 'forge_rule': {
-        const [title, text, aggJson, probesJson, unit, deposit, stake, strikes, pass, defMin, appMin] = a;
+        const [title, text, aggJson, probesJson, unit, deposit, stake, bondArg, strikes, pass, defMin, appMin] = a;
         const t = bounded(title, 3, 80, 'title');
         const body = bounded(text, 20, 1200, 'rule text');
         const aggs = parseAggravators(aggJson);
@@ -180,7 +182,7 @@ export class MockChain {
         need(pass >= 75n && pass <= 100n, 'pass percent');
         need(defMin >= 2n && defMin <= 10080n, 'defense window');
         need(appMin >= 2n && appMin <= 10080n, 'appeal window');
-        const bond = this.receive(ctx, { minimum: unit * 3n });
+        const bond = BigInt(bondArg); need(bond >= unit * 3n, 'bond must be at least three penalty units'); this.debit(ctx.sender, bond);
         const id = S.ruleCount + 1; S.ruleCount = id;
         S.rules[id] = {
           id, author: ctx.sender, title: t, text: body, version: 1, status: 'DRAFT', aggravators: aggs, probes,
@@ -192,6 +194,9 @@ export class MockChain {
         };
         return;
       }
+      case 'deposit': {
+        need(ctx.value > 0n, 'attach a positive value'); S.escrow += ctx.value; this.credit(ctx.sender, ctx.value); return;
+      }
       case 'run_probe': {
         const [rid, index] = a; const r = this.rule(Number(rid)); this.onlyAuthor(ctx, r);
         need(r.status === 'DRAFT', 'only DRAFT');
@@ -202,6 +207,11 @@ export class MockChain {
         const passed = g.verdict === p.expected && canon(g.factors) === canon(p.factors);
         p.result = passed ? 'PASS' : 'FAIL'; r.probes_run += 1; if (passed) r.probes_passed += 1;
         return;
+      }
+      case 'revise_rule': {
+        const r = this.rule(Number(a[0])); this.onlyAuthor(ctx, r);
+        need(r.status === 'DRAFT', 'only a DRAFT rule can be revised'); need(r.version <= 5, 'revision limit reached');
+        r.text = String(a[1]); r.version += 1; r.probes_run = 0; r.probes_passed = 0; return;
       }
       case 'certify_rule': {
         const r = this.rule(Number(a[0])); this.onlyAuthor(ctx, r); need(r.status === 'DRAFT', 'only DRAFT');
@@ -219,7 +229,7 @@ export class MockChain {
         const rid = Number(a[0]); const r = this.rule(rid); need(r.status === 'CERTIFIED', 'not certified');
         const stake = BigInt(r.enlist_stake); let m = this.member(rid, ctx.sender);
         need(m === null || m.status === 'LEFT', 'already enlisted or expelled');
-        this.receive(ctx, { exact: stake });
+        this.debit(ctx.sender, stake);
         if (m === null) m = { rule_id: rid, wallet: ctx.sender, stake: '0', locked: '0', strikes: 0, status: 'ACTIVE', open_cases: 0, joined_at: ctx.now, filed: 0, defended: 0, upheld_against: 0, dismissed_filings: 0 };
         m.stake = stake.toString(); m.status = 'ACTIVE'; r.members += 1; S.members[`${rid}:${ctx.sender}`] = m; return;
       }
@@ -238,7 +248,7 @@ export class MockChain {
         need(pm && pm.status === 'ACTIVE', 'plaintiff not active'); need(dm && dm.status === 'ACTIVE', 'defendant not active');
         need(pm.open_cases < 3, 'plaintiff too many'); need(dm.open_cases < 3, 'defendant too many');
         const reserve = this.maxPenalty(r); need(BigInt(dm.stake) - BigInt(dm.locked) >= reserve, 'stake cannot cover');
-        const deposit = BigInt(r.filing_deposit); this.receive(ctx, { exact: deposit });
+        const deposit = BigInt(r.filing_deposit); this.debit(plaintiff, deposit);
         const id = S.caseCount + 1; S.caseCount = id;
         S.cases[id] = {
           id, rule_id: rid, plaintiff, defendant, statement, defense: '', defense_at: 0, opened_at: ctx.now, defense_due: ctx.now + r.defense_minutes * 60,
@@ -266,8 +276,8 @@ export class MockChain {
       case 'appeal_case': {
         const c = this.kase(Number(a[0])); need(c.status === 'RULED', 'not awaiting'); need(ctx.sender === this.appellant(c), 'adversely affected');
         need(!c.waived, 'waived'); need(ctx.now <= c.appeal_due, 'window closed'); const grounds = bounded(a[1], 8, 500, 'grounds');
-        const r = this.rule(c.rule_id); const deposit = BigInt(r.filing_deposit); need(ctx.value === deposit, 'value must equal');
-        const g = this.judge(ctx, 'APPEAL', r, c.statement, c.defense, grounds); this.receive(ctx, { exact: deposit });
+        const r = this.rule(c.rule_id); const deposit = BigInt(r.filing_deposit); need(this.balanceOf(ctx.sender) >= deposit, 'insufficient ledger balance');
+        const g = this.judge(ctx, 'APPEAL', r, c.statement, c.defense, grounds); this.debit(ctx.sender, deposit);
         c.appeal_by = ctx.sender; c.appeal_grounds = grounds; c.appeal_deposit = deposit.toString(); c.appeal_at = ctx.now;
         c.appeal_verdict = g.verdict; c.appeal_factors = g.factors; c.appeal_reason = g.reason;
         this.settle(ctx, c, r, g, true); return;

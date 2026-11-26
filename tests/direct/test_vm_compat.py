@@ -20,7 +20,7 @@ def test_nondeterministic_closures_pickle_and_capture_only_plain_data(world):
     llm(world.vm, (r"LITMUS", R("BREACH", True, False)))
     world.call(3, "rule_case", cid)
     llm(world.vm, (r"LITMUS", R("COMPLIANT", False, False)))
-    world.call(2, "appeal_case", cid, "The statement does not prove the breach.", value=100)
+    world.appeal(2, cid, "The statement does not prove the breach.")
     assert len(world.vm._captured_validators) == 4 + 1 + 1
     for _, leader_fn, validator_fn in world.vm._captured_validators:
         for fn in (leader_fn, validator_fn):

@@ -8,7 +8,8 @@
     "e2e": "node scripts/live_e2e.mjs",
     "e2e:fast": "node scripts/live_e2e.mjs --skip-slow",
     "e2e:dry": "node scripts/live_e2e.mjs --dry-run",
-    "verify:source": "node scripts/verify_deployed_source.mjs"
+    "verify:source": "node scripts/verify_deployed_source.mjs",
+    "postmortem": "node scripts/check_balances.mjs"
   },
   "dependencies": {
     "genlayer-js": "1.1.8"
