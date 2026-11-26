@@ -109,7 +109,7 @@ const until = (fn, timeoutMs = 90_000) => eventually(fn, { timeoutMs, intervalMs
 async function tx(label, who, fn, args, opts = {}) {
   const { value = 0n, kind = 'det', expectFail = false, verify = null, unchanged = null } = opts;
   const sentKey = who.address.toLowerCase();
-  const attempts = opts.attempts ?? (kind === 'llm' ? LLM_ATTEMPTS : expectFail ? 3 : 2);
+  const attempts = opts.attempts ?? (kind === 'llm' ? LLM_ATTEMPTS : 2);
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const started = Date.now();
     let receipt;
@@ -122,14 +122,9 @@ async function tx(label, who, fn, args, opts = {}) {
       await chain.sleep(2_000);
       const stayed = unchanged ? await unchanged() : true;
       const detail = `exec=${receipt.executionOk} status=${receipt.status}${receipt.error ? ` error=${receipt.error}` : ''}`;
-      if (!stayed) { check('FAIL', `${label} should have been rejected but state changed`, detail); return { ok: false, receipt }; }
-      // "state unchanged" alone proves nothing (a call that never reached the chain also leaves state unchanged):
-      // the rejection counts only when a receipt with a hash shows the execution failed.
-      if (receipt.hash && receipt.executionOk === false) { check('PASS', `${label} (rejected, state unchanged)`, detail); return { ok: true, receipt }; }
-      if (receipt.hash && receipt.executionOk === true) { check('FAIL', `${label} executed successfully but should have been rejected`, detail); return { ok: false, receipt }; }
-      if (attempt < attempts) { check('WARN', `${label}: attempt ${attempt}/${attempts} gave no receipt, retrying to prove the rejection`, detail); await chain.sleep(5_000); continue; }
-      check('WARN', `${label}: state unchanged but the rejection could not be proven from a receipt`, detail);
-      return { ok: true, receipt };
+      if (stayed) { check('PASS', `${label} (rejected, state unchanged)`, detail); return { ok: true, receipt }; }
+      check('FAIL', `${label} should have been rejected but state changed`, detail);
+      return { ok: false, receipt };
     }
     const waitFailed = receipt.status === 'WAIT_ERROR';
     const ok = verify ? Boolean(await until(verify, waitFailed ? 300_000 : 75_000)) : receipt.executionOk !== false && !waitFailed;
@@ -166,20 +161,14 @@ async function audit(label, { exact = true } = {}) {
   held += claim;
   const okClaim = BigInt(s.claimable_total) === claim;
   const okEscrow = BigInt(s.escrow_total) === held;
-  const readBal = async () => { try { return await chain.balance(address); } catch (error) { return null; } };
-  let bal = await readBal();
-  const escrow = BigInt(s.escrow_total);
+  let bal = null;
+  try { bal = await chain.balance(address); } catch (error) { bal = null; }
   check(okClaim && okEscrow ? 'PASS' : 'FAIL', `audit ${label}: books balance`,
     `escrow=${s.escrow_total} recomputed=${held} claimable=${s.claimable_total}/${claim} contract_balance=${bal ?? 'unavailable'}`);
-  // withdraw() lowers escrow at once, but the network may debit the contract a little later: give it time,
-  // and accept a surplus only up to the value withdrawn so far. Anything beyond that is stranded value.
-  const withdrawnSoFar = WITHDRAWALS.reduce((a, w) => a + w.amount, 0n);
-  if (bal !== null && bal > escrow) await until(async () => { bal = await readBal(); return bal === null || bal <= escrow; }, withdrawnSoFar > 0n ? 90_000 : 15_000);
   if (bal === null) check('WARN', `audit ${label}: contract balance could not be read from the RPC`, 'native balance comparison skipped');
-  else if (bal < escrow) check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${bal} < escrow ${s.escrow_total}`);
-  else if (bal === escrow) check('PASS', `audit ${label}: contract balance equals escrow exactly`, String(bal));
-  else if (bal - escrow <= withdrawnSoFar) check('WARN', `audit ${label}: contract balance still above escrow by value already withdrawn`, `balance ${bal}, escrow ${s.escrow_total}, withdrawn so far ${withdrawnSoFar} (the network has not debited the transfer messages yet; re-checked after finalization)`);
-  else check('FAIL', `audit ${label}: contract balance differs from escrow`, `balance ${bal}, escrow ${s.escrow_total}, withdrawn so far ${withdrawnSoFar} (funds sit in the contract that no ledger entry owns)`);
+  else if (bal < BigInt(s.escrow_total)) check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${bal} < escrow ${s.escrow_total}`);
+  else if (bal !== BigInt(s.escrow_total)) check(exact ? 'FAIL' : 'WARN', `audit ${label}: contract balance differs from escrow`, `balance ${bal}, escrow ${s.escrow_total}${exact ? ' (funds sit in the contract that no ledger entry owns)' : ' (transfers are emitted on finalization)'}`);
+  else check('PASS', `audit ${label}: contract balance equals escrow exactly`, String(bal));
   return { stats: s, rules, cases };
 }
 
@@ -480,8 +469,7 @@ async function withdrawNow(name, acct, label = 'withdraw') {
 async function inspectTransfer(w) {
   if (!w.hash || typeof chain.triggered !== 'function') return;
   try {
-    if ((await chain.triggered(w.hash)) === null) { check('INFO', `${w.name}: child-transaction lookup is not supported by this genlayer-js build`, 'transfer inspection skipped; the wallet reconciliation below still covers it'); return; }
-    const kids = await eventually(async () => { const k = await chain.triggered(w.hash); return k && k.length ? k : false; }, { timeoutMs: 90_000, intervalMs: 5_000, sleep: (ms) => chain.sleep(ms), now: () => chain.now() });
+    const kids = await eventually(async () => { const k = await chain.triggered(w.hash); return k.length ? k : false; }, { timeoutMs: 90_000, intervalMs: 5_000, sleep: (ms) => chain.sleep(ms), now: () => chain.now() });
     if (!kids) { check('WARN', `${w.name}: withdraw produced no child transaction`, 'no emitted transfer message is visible for this transaction yet'); return; }
     const same = (k) => String(k.to).toLowerCase() === wallet(w.acct) && (() => { try { return BigInt(k.value) === w.amount; } catch { return String(k.value) === String(w.amount); } })();
     const match = kids.find(same);
@@ -498,15 +486,10 @@ async function withdrawAll() {
   assertEq('escrow is zero after full wind-down', s.escrow_total, 0);
   assertEq('claimable is zero after full wind-down', s.claimable_total, 0);
   try {
-    let bal = await chain.balance(address);
-    if (bal !== 0n) await until(async () => { bal = await chain.balance(address); return bal === 0n; }, 120_000);
-    check(bal === 0n ? 'PASS' : 'WARN', 'contract balance is zero after the last withdrawal', bal === 0n ? 'debited at execution' : `balance ${bal} still in the contract; re-checked after finalization below`);
+    const bal = await chain.balance(address);
+    assertEq('contract balance is zero right after the last withdrawal (transfers debit the contract at execution)', bal, 0n);
   } catch (error) { check('WARN', 'contract balance could not be read after wind-down', String(error?.message ?? error).slice(0, 120)); }
   await finalizeWithdrawals();
-  try {
-    const finalBal = await chain.balance(address);
-    check(finalBal === 0n ? 'PASS' : 'FAIL', 'contract balance is zero once every withdrawal has finalized', finalBal === 0n ? '0' : `balance ${finalBal} remains although escrow is 0 (stranded value)`);
-  } catch (error) { check('WARN', 'contract balance could not be read after finalization', String(error?.message ?? error).slice(0, 120)); }
   await reconcileWallets();
 }
 

@@ -208,11 +208,6 @@ export class MockChain {
         p.result = passed ? 'PASS' : 'FAIL'; r.probes_run += 1; if (passed) r.probes_passed += 1;
         return;
       }
-      case 'revise_rule': {
-        const r = this.rule(Number(a[0])); this.onlyAuthor(ctx, r);
-        need(r.status === 'DRAFT', 'only a DRAFT rule can be revised'); need(r.version <= 5, 'revision limit reached');
-        r.text = String(a[1]); r.version += 1; r.probes_run = 0; r.probes_passed = 0; return;
-      }
       case 'certify_rule': {
         const r = this.rule(Number(a[0])); this.onlyAuthor(ctx, r); need(r.status === 'DRAFT', 'only DRAFT');
         const total = r.probes.length; need(r.probes_run === total, 'run every probe first');

@@ -2,19 +2,6 @@
 import { createHash } from 'node:crypto';
 
 export const sleepReal = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const errorText = (error) => [error?.details, error?.shortMessage, error?.message, String(error)].filter(Boolean).join(' ');
-export const isTransientRpcError = (error) => /rate limit|too many requests|\b429\b|<!DOCTYPE|is not valid JSON|HTTP request failed|Status: 50[234]|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(errorText(error));
-
-/** Retry `fn` with exponential backoff while it fails with an error that says nothing about the contract (rate limit, gateway page, dropped socket). */
-export async function retryTransient(fn, { attempts = 5, baseMs = 4_000, maxMs = 30_000, sleep = sleepReal, shouldRetry = isTransientRpcError } = {}) {
-  for (let attempt = 1; ; attempt += 1) {
-    try { return await fn(); } catch (error) {
-      if (attempt >= attempts || !shouldRetry(error)) throw error;
-      await sleep(Math.min(maxMs, baseMs * 2 ** (attempt - 1)));
-    }
-  }
-}
 export const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 
 /** Canonical JSON with recursively sorted keys; byte-identical to Python json.dumps(sort_keys, compact). */

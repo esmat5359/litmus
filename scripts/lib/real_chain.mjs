@@ -2,7 +2,7 @@
 import { createClient, createAccount, generatePrivateKey } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
 import { TransactionStatus } from 'genlayer-js/types';
-import { sleepReal, retryTransient } from './common.mjs';
+import { sleepReal } from './common.mjs';
 
 const STATUS_NAMES = {
   0: 'UNINITIALIZED', 1: 'PENDING', 2: 'PROPOSING', 3: 'COMMITTING', 4: 'REVEALING', 5: 'ACCEPTED',
@@ -101,7 +101,7 @@ export class RealChain {
   async fundAccount(address, weiAmount) {
     await this.client.request({ method: 'sim_fundAccount', params: [address, Number(weiAmount)] });
   }
-  async balance(address) { return BigInt(await retryTransient(() => this.client.getBalance({ address }))); }
+  async balance(address) { return BigInt(await this.client.getBalance({ address })); }
   async deploy(code, acct) {
     const hash = await this.client.deployContract({ account: acct.account, code, args: [] });
     const raw = await this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED, retries: this.retries, interval: this.intervalMs, fullTransaction: true });
@@ -152,9 +152,7 @@ export class RealChain {
   }
   /** Child transactions created by emitted messages (emit_transfer shows up here on Studio). */
   async triggered(hash) {
-    // Older/newer genlayer-js builds may not expose this call: report 'unavailable' (null) instead of throwing.
-    if (typeof this.client.getTriggeredTransactionIds !== 'function') return null;
-    const ids = await retryTransient(() => this.client.getTriggeredTransactionIds({ hash }));
+    const ids = await this.client.getTriggeredTransactionIds({ hash });
     const out = [];
     for (const id of ids) {
       const tx = await this.client.getTransaction({ hash: id });
@@ -163,7 +161,7 @@ export class RealChain {
     return out;
   }
   async read(address, fn, args = []) {
-    return retryTransient(() => this.client.readContract({ address, functionName: fn, args }));
+    return this.client.readContract({ address, functionName: fn, args });
   }
   async contractCode(address) {
     const response = await fetch(this.rpc ?? studionet.rpcUrls.default.http[0], {
