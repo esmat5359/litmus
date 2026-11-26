@@ -29,13 +29,13 @@ def ruled_case(world, statement, ruling, *, defense=None, pattern=None):
 
 def test_file_case_checks_and_escrows_deposit(ready):
     w = ready
-    w.fail(4, "file_case", 1, w.w(DEFENDANT), S_PLAIN, match="plaintiff is not an active member")
-    w.fail(PLAINTIFF, "file_case", 1, w.w(4), S_PLAIN, match="defendant is not an active member")
-    w.fail(PLAINTIFF, "file_case", 1, w.w(PLAINTIFF), S_PLAIN, match="yourself")
-    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), S_PLAIN, match="insufficient ledger balance")
-    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), "too short", match="statement")
-    w.fail(PLAINTIFF, "file_case", 1, "0x" + "0" * 40, S_PLAIN, match="zero wallet")
-    w.fail(PLAINTIFF, "file_case", 1, "garbage", S_PLAIN, match="invalid wallet")
+    w.fail(4, "file_case", 1, w.w(DEFENDANT), S_PLAIN, value=DEPOSIT, match="plaintiff is not an active member")
+    w.fail(PLAINTIFF, "file_case", 1, w.w(4), S_PLAIN, value=DEPOSIT, match="defendant is not an active member")
+    w.fail(PLAINTIFF, "file_case", 1, w.w(PLAINTIFF), S_PLAIN, value=DEPOSIT, match="yourself")
+    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), S_PLAIN, value=DEPOSIT - 1, match="must equal")
+    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), "too short", value=DEPOSIT, match="statement")
+    w.fail(PLAINTIFF, "file_case", 1, "0x" + "0" * 40, S_PLAIN, value=DEPOSIT, match="zero wallet")
+    w.fail(PLAINTIFF, "file_case", 1, "garbage", S_PLAIN, value=DEPOSIT, match="invalid wallet")
     before = int(w.stats()["escrow_total"])
     cid = w.file(PLAINTIFF, DEFENDANT, S_PLAIN)
     case = w.case(cid)
@@ -138,14 +138,14 @@ def test_settlement_gates_and_waiver_eligibility(ready):
     w.at(due - BASE_TS + 1)
     w.call(OTHER, "settle_case", cid)
     w.fail(OTHER, "settle_case", cid, match="not awaiting settlement")
-    w.fail(DEFENDANT, "appeal_case", cid, "Late appeal grounds here.", match="not awaiting settlement")
+    w.fail(DEFENDANT, "appeal_case", cid, "Late appeal grounds here.", value=DEPOSIT, match="not awaiting settlement")
 
 
 def test_waiver_blocks_appeal_and_enables_early_settlement(ready):
     w = ready
     cid = ruled_case(w, S_PLAIN, R("BREACH", True, False))
     w.call(DEFENDANT, "waive_appeal", cid)
-    w.fail(DEFENDANT, "appeal_case", cid, "I changed my mind about this.", match="waived")
+    w.fail(DEFENDANT, "appeal_case", cid, "I changed my mind about this.", value=DEPOSIT, match="waived")
     w.call(OTHER, "settle_case", cid)
     assert w.case(cid)["penalty"] == str(2 * UNIT)
 
@@ -154,12 +154,12 @@ def test_appeal_requirements(ready):
     w = ready
     cid = ruled_case(w, S_PLAIN, R("BREACH", False, False))
     llm(w.vm, (APPEAL, R("COMPLIANT", False, False)))
-    w.fail(PLAINTIFF, "appeal_case", cid, "Plaintiff cannot appeal a win.", match="adversely affected")
-    w.fail(OTHER, "appeal_case", cid, "Bystanders cannot appeal a case.", match="adversely affected")
-    w.fail(DEFENDANT, "appeal_case", cid, "Short grounds.", match="insufficient ledger balance")
-    w.fail(DEFENDANT, "appeal_case", cid, "x", match="appeal grounds")
+    w.fail(PLAINTIFF, "appeal_case", cid, "Plaintiff cannot appeal a win.", value=DEPOSIT, match="adversely affected")
+    w.fail(OTHER, "appeal_case", cid, "Bystanders cannot appeal a case.", value=DEPOSIT, match="adversely affected")
+    w.fail(DEFENDANT, "appeal_case", cid, "Short grounds.", value=DEPOSIT - 1, match="must equal")
+    w.fail(DEFENDANT, "appeal_case", cid, "x", value=DEPOSIT, match="appeal grounds")
     w.at(250)
-    w.fail(DEFENDANT, "appeal_case", cid, "Appeal after the window closed.", match="window closed")
+    w.fail(DEFENDANT, "appeal_case", cid, "Appeal after the window closed.", value=DEPOSIT, match="window closed")
     assert w.case(cid)["status"] == "RULED"
 
 
@@ -167,10 +167,9 @@ def test_failed_appeal_model_call_reverts_everything(ready):
     w = ready
     cid = ruled_case(w, S_PLAIN, R("BREACH", False, False))
     llm(w.vm, (APPEAL, "garbage"))
-    w.fund(DEFENDANT, DEPOSIT)
     before = w.stats()
     with w.vm.expect_revert("LLM_ERROR"):
-        w.call(DEFENDANT, "appeal_case", cid, "The post linked to a free page.")
+        w.call(DEFENDANT, "appeal_case", cid, "The post linked to a free page.", value=DEPOSIT)
     assert w.case(cid)["status"] == "RULED" and w.case(cid)["appeal_by"] == ""
     assert w.stats() == before
 
@@ -179,7 +178,7 @@ def test_favorable_defendant_appeal_slashes_bond_and_pays_exactly(ready):
     w = ready
     cid = ruled_case(w, S_PLAIN, R("BREACH", True, False))
     llm(w.vm, (APPEAL, R("COMPLIANT", False, False)))
-    w.appeal(DEFENDANT, cid, "The linked page was a free resource.")
+    w.call(DEFENDANT, "appeal_case", cid, "The linked page was a free resource.", value=DEPOSIT)
     case = w.case(cid)
     assert case["status"] == "SETTLED" and case["reversed"] is True and case["final_verdict"] == "COMPLIANT"
     assert case["verdict"] == "BREACH" and case["appeal_verdict"] == "COMPLIANT" and case["penalty"] == "0"
@@ -195,7 +194,7 @@ def test_unfavorable_defendant_appeal_pays_plaintiff_and_uses_appeal_factors(rea
     w = ready
     cid = ruled_case(w, S_PLAIN, R("BREACH", False, False))
     llm(w.vm, (APPEAL, R("BREACH", True, True)))
-    w.appeal(DEFENDANT, cid, "Nothing in the statement says I tagged anyone.")
+    w.call(DEFENDANT, "appeal_case", cid, "Nothing in the statement says I tagged anyone.", value=DEPOSIT)
     case = w.case(cid)
     assert case["reversed"] is False and case["final_severity"] == 3 and case["penalty"] == str(3 * UNIT)
     assert w.claimable(PLAINTIFF) == DEPOSIT + 3 * UNIT + DEPOSIT   # filing refund + penalty + forfeited appeal deposit
@@ -209,20 +208,20 @@ def test_plaintiff_appeal_paths(ready):
     # COMPLIANT -> BREACH: favorable
     a = ruled_case(w, S_FREE, R("COMPLIANT", False, False))
     llm(w.vm, (APPEAL, R("BREACH", False, True)))
-    w.appeal(PLAINTIFF, a, "The map page also sells paid tours.")
+    w.call(PLAINTIFF, "appeal_case", a, "The map page also sells paid tours.", value=DEPOSIT)
     assert w.case(a)["reversed"] is True and w.case(a)["penalty"] == str(2 * UNIT)
     assert w.claimable(PLAINTIFF) == DEPOSIT + 2 * UNIT + DEPOSIT + UNIT
     # COMPLIANT -> INCONCLUSIVE: changed but not favorable; appeal deposit goes to defendant
     b = ruled_case(w, S_FREE + " Second.", R("COMPLIANT", False, False), pattern=CASE + "Second")
     llm(w.vm, (APPEAL, R("INCONCLUSIVE", False, False)))
     claim_before = w.claimable(DEFENDANT)
-    w.appeal(PLAINTIFF, b, "The statement leaves a decisive fact open.")
+    w.call(PLAINTIFF, "appeal_case", b, "The statement leaves a decisive fact open.", value=DEPOSIT)
     assert w.case(b)["reversed"] is False and w.case(b)["final_verdict"] == "INCONCLUSIVE"
     assert w.claimable(DEFENDANT) == claim_before + DEPOSIT
     # INCONCLUSIVE -> INCONCLUSIVE: unfavorable
     c = ruled_case(w, S_VAGUE, R("INCONCLUSIVE", False, False), pattern=CASE + "does not say what")
     llm(w.vm, (APPEAL, R("INCONCLUSIVE", False, False)))
-    w.appeal(PLAINTIFF, c, "More detail should be accepted here.")
+    w.call(PLAINTIFF, "appeal_case", c, "More detail should be accepted here.", value=DEPOSIT)
     assert w.case(c)["reversed"] is False and w.rule()["reversals"] == 1
     w.audit()
 
@@ -233,12 +232,12 @@ def test_two_reversals_suspend_the_rule_but_open_cases_still_settle(ready):
     for n in range(2):
         cid = ruled_case(w, S_PLAIN + f" Number {n}.", R("BREACH", False, False), pattern=CASE + f"Number {n}")
         llm(w.vm, (APPEAL, R("COMPLIANT", False, False)))
-        w.appeal(DEFENDANT, cid, "It was a free resource for everyone.")
+        w.call(DEFENDANT, "appeal_case", cid, "It was a free resource for everyone.", value=DEPOSIT)
     rule = w.rule()
     assert rule["status"] == "SUSPENDED" and rule["reversals"] == 2
     assert rule["bond_remaining"] == str(BOND - 2 * UNIT)
-    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), S_PLAIN, match="not certified")
-    w.fail(4, "enlist", 1, match="not certified")
+    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), S_PLAIN, value=DEPOSIT, match="not certified")
+    w.fail(4, "enlist", 1, value=STAKE, match="not certified")
     llm(w.vm, (CASE, R("INCONCLUSIVE", False, False)))
     w.at(300)
     w.call(PLAINTIFF, "rule_case", open_case)                 # existing cases continue
@@ -261,7 +260,7 @@ def test_bond_slash_is_capped_by_remaining_bond(world):
         llm(w.vm, (CASE + f"Number {n}", R("BREACH", False, False)))
         w.call(OTHER, "rule_case", cid)
         llm(w.vm, (APPEAL, R("COMPLIANT", False, False)))
-        w.appeal(DEFENDANT, cid, "It was a free resource for everyone.")
+        w.call(DEFENDANT, "appeal_case", cid, "It was a free resource for everyone.", value=DEPOSIT)
     assert w.rule()["bond_remaining"] == str(UNIT)
     w.audit()
 
@@ -273,17 +272,17 @@ def test_open_case_limits_and_stake_reservation(world):
         w.enlist(who, rid)
     for plaintiff in (1, 3, 4):
         w.file(plaintiff, 2, S_PLAIN + f" By {plaintiff}.")
-    w.fail(5, "file_case", rid, w.w(2), S_PLAIN, match="defendant has too many open cases")
+    w.fail(5, "file_case", rid, w.w(2), S_PLAIN, value=DEPOSIT, match="defendant has too many open cases")
     for n in range(3):                                         # plaintiff 1 already has 1 open; fill to 3
         if n < 2:
             w.file(1, 3 + n, S_PLAIN + f" Extra {n}.")
-    w.fail(1, "file_case", rid, w.w(5), S_PLAIN, match="plaintiff has too many open cases")
+    w.fail(1, "file_case", rid, w.w(5), S_PLAIN, value=DEPOSIT, match="plaintiff has too many open cases")
     w.audit()
     tight = w.certified_rule(stake=3 * UNIT, title="Tight stake rule")
     for who in (6, 7, 8):
         w.enlist(who, tight)
     w.file(6, 7, S_PLAIN, tight)
-    w.fail(8, "file_case", tight, w.w(7), S_PLAIN, match="cannot cover another case")
+    w.fail(8, "file_case", tight, w.w(7), S_PLAIN, value=DEPOSIT, match="cannot cover another case")
     w.audit()
 
 
@@ -303,9 +302,9 @@ def test_strikes_expel_and_expelled_members_are_handled(ready):
     member = w.member(rid, DEFENDANT)
     assert member["status"] == "EXPELLED" and member["strikes"] == 1 and w.rule(rid)["members"] == 2
     w.fail(DEFENDANT, "leave", rid, match="open cases pending")
-    w.fail(DEFENDANT, "enlist", rid, match="already enlisted or expelled")
-    w.fail(DEFENDANT, "file_case", rid, w.w(PLAINTIFF), S_PLAIN, match="not an active member")
-    w.fail(PLAINTIFF, "file_case", rid, w.w(DEFENDANT), S_PLAIN, match="defendant is not an active member")
+    w.fail(DEFENDANT, "enlist", rid, value=STAKE, match="already enlisted or expelled")
+    w.fail(DEFENDANT, "file_case", rid, w.w(PLAINTIFF), S_PLAIN, value=DEPOSIT, match="not an active member")
+    w.fail(PLAINTIFF, "file_case", rid, w.w(DEFENDANT), S_PLAIN, value=DEPOSIT, match="defendant is not an active member")
     w.call(OTHER, "waive_appeal", second)
     w.call(1, "settle_case", second)
     w.call(DEFENDANT, "leave", rid)
@@ -333,7 +332,7 @@ def test_reclaim_bond_blocked_while_cases_open_then_allowed(ready):
     cid = w.file(PLAINTIFF, DEFENDANT, S_FREE)
     w.call(0, "retire_rule", 1)
     w.fail(0, "reclaim_bond", 1, match="cases are still open")
-    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), S_PLAIN, match="not certified")
+    w.fail(PLAINTIFF, "file_case", 1, w.w(DEFENDANT), S_PLAIN, value=DEPOSIT, match="not certified")
     llm(w.vm, (CASE, R("COMPLIANT", False, False)))
     w.at(130)
     w.call(OTHER, "rule_case", cid)

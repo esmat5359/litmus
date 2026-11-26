@@ -52,3 +52,27 @@ export async function eventually(check, { timeoutMs = 90_000, intervalMs = 2_500
     await sleep(intervalMs);
   }
 }
+
+const errorText = (error) => [error?.details, error?.shortMessage, error?.message, String(error)].filter(Boolean).join(' ');
+
+/** The RPC explicitly refused the request (rate limit): nothing was processed, so even a write may be repeated. */
+export const isRateLimitError = (error) => /rate limit|too many requests|\b429\b/i.test(errorText(error));
+
+/**
+ * Errors that say nothing about the contract: rate limits, gateway HTML pages instead of JSON, dropped
+ * connections. A long receipt-wait timeout is deliberately NOT transient (retrying would only multiply it).
+ */
+export const isTransientRpcError = (error) => isRateLimitError(error)
+  || /<!DOCTYPE|is not valid JSON|HTTP request failed|Status: 50[234]|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(errorText(error));
+
+/** Retry `fn` with exponential backoff while it fails with an error that `shouldRetry` calls transient. */
+export async function retryTransient(fn, { attempts = 6, baseMs = 5_000, maxMs = 30_000, sleep = sleepReal, shouldRetry = isTransientRpcError, onRetry = null } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try { return await fn(); } catch (error) {
+      if (attempt >= attempts || !shouldRetry(error)) throw error;
+      const waitMs = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
+      if (onRetry) onRetry({ attempt, attempts, waitMs, error });
+      await sleep(waitMs);
+    }
+  }
+}

@@ -110,18 +110,14 @@ class World:
     def stats(self):
         return self.view("get_stats")
 
-    def fund(self, who, amount):
-        """The only way value enters the contract: deposit() credits the caller's ledger."""
-        return self.call(who, "deposit", value=amount)
-
     def forge(self, who=0, *, text=RULE_TEXT, aggravators=None, probes=None, unit=UNIT, deposit=DEPOSIT,
               stake=STAKE, strikes=3, pass_percent=100, defense_minutes=2, appeal_minutes=2, bond=BOND,
               title="No paid promotion"):
         aggravators = AGGRAVATORS if aggravators is None else aggravators
         probes = PROBES if probes is None else probes
-        self.fund(who, bond)
         return self.call(who, "forge_rule", title, text, json.dumps(aggravators), json.dumps(probes),
-                         unit, deposit, stake, bond, strikes, pass_percent, defense_minutes, appeal_minutes)
+                         unit, deposit, stake, strikes, pass_percent, defense_minutes, appeal_minutes,
+                         value=bond)
 
     def certify(self, who=0, rid=1, pairs=None):
         llm(self.vm, *(PROBE_PAIRS if pairs is None else pairs))
@@ -135,17 +131,11 @@ class World:
         return rid
 
     def enlist(self, who, rid=1):
-        self.fund(who, int(self.rule(rid)["enlist_stake"]))
-        self.call(who, "enlist", rid)
+        self.call(who, "enlist", rid, value=int(self.rule(rid)["enlist_stake"]))
 
     def file(self, who, defendant, statement, rid=1):
-        self.fund(who, int(self.rule(rid)["filing_deposit"]))
-        return self.call(who, "file_case", rid, self.w(defendant), statement)
-
-    def appeal(self, who, cid, grounds):
-        rid = self.case(cid)["rule_id"]
-        self.fund(who, int(self.rule(rid)["filing_deposit"]))
-        return self.call(who, "appeal_case", cid, grounds)
+        return self.call(who, "file_case", rid, self.w(defendant), statement,
+                         value=int(self.rule(rid)["filing_deposit"]))
 
     def audit(self):
         """Recompute every liability from raw records and compare with the counters."""

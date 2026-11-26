@@ -85,7 +85,7 @@ def test_exact_equality_matrix_all_modes(world, n):
     run_matrix(world, n, "CASE")
 
     llm(world.vm, (r"LITMUS", R("BREACH", *([False] * n))))
-    world.appeal(2, cid, "The statement does not prove the breach.")
+    world.call(2, "appeal_case", cid, "The statement does not prove the breach.", value=100)
     run_matrix(world, n, "APPEAL")
 
 

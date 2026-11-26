@@ -1,10 +1,11 @@
 node_modules/
+.venv/
+venv/
 artifacts/
 .genvmroot/
 .pytest_cache/
 __pycache__/
 *.pyc
 .env
-reports/*.json
-reports/*.md
-!reports/.gitkeep
+# dry-run reports are throw-away; the Studionet reports are submission evidence and must be committed
+reports/live_e2e_dryrun_*

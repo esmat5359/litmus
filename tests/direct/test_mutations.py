@@ -78,7 +78,7 @@ def check_behaviour(w):
     w.call(3, "rule_case", c)
     # favourable appeal slashes the bond
     llm(w.vm, (r"(?s)MODE: APPEAL", R("COMPLIANT", False, False)))
-    w.appeal(2, c, "The page linked here was free of charge.")
+    w.call(2, "appeal_case", c, "The page linked here was free of charge.", value=DEPOSIT)
     assert w.rule()["bond_remaining"] == str(6000 - UNIT) and w.rule()["reversals"] == 1
     # withdraw pays once
     w.call(1, "withdraw")
@@ -105,26 +105,6 @@ def check_void(w):
     assert w.claimable(1) == DEPOSIT and w.member(rid, 2)["locked"] == "0"
     assert w.rule(rid)["voided"] == 1 and w.rule(rid)["open_cases"] == 0
     w.audit()
-
-
-def check_funding(w):
-    """Every action must spend ledger balance exactly once; deposits must be credited; nothing is free."""
-    rid = w.certified_rule()                         # forge: bond debited
-    assert w.claimable(0) == 0
-    w.fund(1, STAKE_)
-    w.call(1, "enlist", rid)
-    assert w.claimable(1) == 0 and w.member(rid, 1)["stake"] == str(STAKE_)
-    w.fund(2, STAKE_)
-    w.call(2, "enlist", rid)
-    w.fund(1, DEPOSIT)
-    w.call(1, "file_case", rid, w.w(2), S_PLAIN)
-    assert w.claimable(1) == 0
-    with w.vm.expect_revert("insufficient ledger balance"):
-        w.call(1, "file_case", rid, w.w(2), S_PLAIN + " Second time.")
-    w.audit()
-
-
-STAKE_ = 9000
 
 
 # ---------------------------------------------------------------------------- mutants
@@ -171,12 +151,6 @@ MUTANTS = {
     "void_any_time": ('        self._require(now > case["defense_due"] + VOID_AFTER_SECONDS, "case is not yet voidable")\n', "", check_void),
     "void_without_refund": ('        self._credit(case["plaintiff"], int(case["deposit"]))\n        case["final_verdict"] = "VOID"', '        case["final_verdict"] = "VOID"', check_void),
     "void_keeps_reservation": ('        dm["locked"] = str(int(dm["locked"]) - int(case["reserve"]))\n        pm["open_cases"] -= 1\n        dm["open_cases"] -= 1\n        rule["open_cases"] -= 1\n        rule["voided"] += 1', '        pm["open_cases"] -= 1\n        dm["open_cases"] -= 1\n        rule["open_cases"] -= 1\n        rule["voided"] += 1', check_void),
-    "forge_bond_not_debited": ("        self._debit(author, bond)\n", "", check_funding),
-    "enlist_stake_not_debited": ("        self._debit(wallet, stake)\n        if member is None:", "        if member is None:", check_funding),
-    "file_deposit_not_debited": ("        self._debit(plaintiff, deposit)\n        cid = int(self.case_count) + 1", "        cid = int(self.case_count) + 1", check_funding),
-    "appeal_deposit_not_debited": ("        self._debit(who, deposit)         # state is only touched after the model call succeeded\n", "", check_behaviour),
-    "deposit_not_credited": ("        self.escrow_total = u256(int(self.escrow_total) + value)\n        self._credit(wallet, value)\n", "        self.escrow_total = u256(int(self.escrow_total) + value)\n", check_funding),
-    "debit_without_balance_check": ('        self._require(balance >= amount, "insufficient ledger balance: deposit first")\n', "", check_funding),
     "leave_with_open_cases": ('        self._require(member["open_cases"] == 0, "open cases pending")\n', "", check_behaviour),
     "no_bond_slash": ('                slash = min(unit, int(rule["bond_remaining"]))', '                slash = 0', check_behaviour),
 }
@@ -208,11 +182,6 @@ def test_mutant_is_killed(name, direct_deploy, direct_vm, direct_accounts, tmp_p
 def test_control_behaviour_checks_pass_on_original(direct_deploy, direct_vm, direct_accounts):
     with build_world(direct_deploy, direct_vm, direct_accounts) as w:
         check_behaviour(w)
-
-
-def test_control_funding_check_passes_on_original(direct_deploy, direct_vm, direct_accounts):
-    with build_world(direct_deploy, direct_vm, direct_accounts) as w:
-        check_funding(w)
 
 
 def test_control_void_check_passes_on_original(direct_deploy, direct_vm, direct_accounts):

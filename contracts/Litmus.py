@@ -18,12 +18,6 @@ Consensus law of this contract (see docs/CONSENSUS.md):
 * Only the free-text ``reason`` is compared loosely (it must be a sane,
   bounded, non-empty string).  It is never decision-bearing.
 
-Funding model (found necessary by the first live Studionet run): a call that is rejected keeps the
-native value that was attached to it, and a contract cannot refund inside a call that reverts.  So only
-``deposit()`` accepts value and cannot fail once value is attached; every other
-method is non-payable and moves money between ledger buckets.  A rejected call therefore never strands
-funds.  ``withdraw()`` sends a ledger balance back to its owner.
-
 Targets GenVM v0.2.16 (stable).
 """
 from genlayer import *
@@ -366,23 +360,13 @@ class Litmus(gl.Contract):
     def _save_member(self, member):
         self.members[self._member_key(member["rule_id"], member["wallet"])] = self._dump(member)
 
-    def _balance_of(self, wallet):
-        return int(self.claimable.get(wallet, u256(0)))
-
-    def _debit(self, wallet, amount):
-        """Move ``amount`` out of the wallet's ledger balance into an escrow bucket (no value enters or leaves)."""
-        amount = int(amount)
-        balance = self._balance_of(wallet)
-        self._require(balance >= amount, "insufficient ledger balance: deposit first")
-        self.claimable[wallet] = u256(balance - amount)
-        self.claimable_total = u256(int(self.claimable_total) - amount)
-
-    def _accept_value(self):
+    def _receive(self, exact=None, minimum=None):
         value = int(gl.message.value)
-        self._require(value > 0, "attach a positive value")
-        wallet = self._actor()
+        if exact is not None:
+            self._require(value == exact, "attached value must equal the required amount")
+        if minimum is not None:
+            self._require(value >= minimum, "attached value below the required minimum")
         self.escrow_total = u256(int(self.escrow_total) + value)
-        self._credit(wallet, value)
         return value
 
     def _credit(self, wallet, amount):
@@ -399,15 +383,10 @@ class Litmus(gl.Contract):
     def _only_author(self, rule):
         self._require(self._actor() == rule["author"], "only the rule author")
 
-    # ------------------------------------------------------------------ funding
-    @gl.public.write.payable
-    def deposit(self) -> None:
-        self._accept_value()
-
     # -------------------------------------------------------------- rule forging
-    @gl.public.write
+    @gl.public.write.payable
     def forge_rule(self, title: str, text: str, aggravators_json: str, probes_json: str,
-                   penalty_unit: u256, filing_deposit: u256, enlist_stake: u256, bond: u256,
+                   penalty_unit: u256, filing_deposit: u256, enlist_stake: u256,
                    strike_limit: u8, pass_percent: u8,
                    defense_minutes: u32, appeal_minutes: u32) -> u32:
         author = self._actor()
@@ -422,9 +401,7 @@ class Litmus(gl.Contract):
         self._require(75 <= int(pass_percent) <= 100, "pass percent must be 75-100")
         defense_minutes = self._minutes(defense_minutes, "defense window")
         appeal_minutes = self._minutes(appeal_minutes, "appeal window")
-        bond = int(bond)
-        self._require(bond >= unit * 3, "bond must be at least three penalty units")
-        self._debit(author, bond)
+        bond = self._receive(minimum=unit * 3)
         rid = int(self.rule_count) + 1
         self.rule_count = u32(rid)
         rule = {
@@ -519,7 +496,7 @@ class Litmus(gl.Contract):
         self._credit(rule["author"], remaining)
 
     # ----------------------------------------------------------------- members
-    @gl.public.write
+    @gl.public.write.payable
     def enlist(self, rid: u32) -> None:
         rule = self._rule(rid)
         self._require(rule["status"] == "CERTIFIED", "rule is not certified")
@@ -527,7 +504,7 @@ class Litmus(gl.Contract):
         stake = int(rule["enlist_stake"])
         member = self._member(rid, wallet)
         self._require(member is None or member["status"] == "LEFT", "already enlisted or expelled")
-        self._debit(wallet, stake)
+        self._receive(exact=stake)
         if member is None:
             member = {"rule_id": int(rid), "wallet": wallet, "stake": "0", "locked": "0",
                       "strikes": 0, "status": "ACTIVE", "open_cases": 0, "joined_at": self._now(),
@@ -557,7 +534,7 @@ class Litmus(gl.Contract):
         self._credit(wallet, stake)
 
     # ------------------------------------------------------------------- cases
-    @gl.public.write
+    @gl.public.write.payable
     def file_case(self, rid: u32, defendant: str, statement: str) -> u32:
         rule = self._rule(rid)
         self._require(rule["status"] == "CERTIFIED", "rule is not certified")
@@ -574,7 +551,7 @@ class Litmus(gl.Contract):
         reserve = self._max_penalty(rule)
         self._require(int(dm["stake"]) - int(dm["locked"]) >= reserve, "defendant stake cannot cover another case")
         deposit = int(rule["filing_deposit"])
-        self._debit(plaintiff, deposit)
+        self._receive(exact=deposit)
         cid = int(self.case_count) + 1
         self.case_count = u32(cid)
         now = self._now()
@@ -645,7 +622,7 @@ class Litmus(gl.Contract):
         case["waived"] = True
         self._save_case(case)
 
-    @gl.public.write
+    @gl.public.write.payable
     def appeal_case(self, cid: u32, grounds: str) -> None:
         case = self._case(cid)
         self._require(case["status"] == "RULED", "case is not awaiting settlement")
@@ -656,12 +633,12 @@ class Litmus(gl.Contract):
         grounds = bounded(grounds, 8, 500, "appeal grounds")
         rule = self._rule(case["rule_id"])
         deposit = int(rule["filing_deposit"])
-        self._require(self._balance_of(who) >= deposit, "insufficient ledger balance: deposit first")
+        self._require(int(gl.message.value) == deposit, "attached value must equal the required amount")
         n = len(rule["aggravators"])
         prompt = build_prompt("APPEAL", rule["text"], rule["aggravators"], case["statement"],
                               case["defense"], grounds)
         ruling = judge(prompt, n, CASE_VERDICTS)
-        self._debit(who, deposit)         # state is only touched after the model call succeeded
+        self._receive(exact=deposit)      # state is only touched after the model call succeeded
         case["appeal_by"] = who
         case["appeal_grounds"] = grounds
         case["appeal_deposit"] = str(deposit)

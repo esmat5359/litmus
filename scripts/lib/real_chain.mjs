@@ -2,7 +2,7 @@
 import { createClient, createAccount, generatePrivateKey } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
 import { TransactionStatus } from 'genlayer-js/types';
-import { sleepReal } from './common.mjs';
+import { isRateLimitError, retryTransient, sleepReal } from './common.mjs';
 
 const STATUS_NAMES = {
   0: 'UNINITIALIZED', 1: 'PENDING', 2: 'PROPOSING', 3: 'COMMITTING', 4: 'REVEALING', 5: 'ACCEPTED',
@@ -53,123 +53,96 @@ function findContractAddress(r) {
   return typeof to === 'string' && /^0x[0-9a-fA-F]{40}$/.test(to) && !/^0x0{40}$/.test(to) ? to : null;
 }
 
-/**
- * The public Studionet RPC allows 30 requests per minute and answers with an error (or an HTML page) beyond that.
- * Every request to the RPC host goes through one queue with a minimum gap, and rate-limit answers are retried.
- */
-function installThrottle(rpcUrl) {
-  if (globalThis.__litmusThrottle) return;
-  const host = new URL(rpcUrl).host;
-  const original = globalThis.fetch.bind(globalThis);
-  const gap = Number(process.env.LITMUS_MIN_GAP_MS ?? 2300);
-  let nextSlot = 0;
-  globalThis.__litmusThrottle = true;
-  globalThis.fetch = async (input, init) => {
-    const url = typeof input === 'string' ? input : (input?.url ?? String(input));
-    if (!url.includes(host)) return original(input, init);
-    for (let attempt = 0; ; attempt += 1) {
-      const now = Date.now();
-      const wait = Math.max(0, nextSlot - now);
-      nextSlot = Math.max(now, nextSlot) + gap;
-      if (wait) await sleepReal(wait);
-      const response = await original(input, init);
-      const type = response.headers.get('content-type') ?? '';
-      let limited = [429, 502, 503, 504].includes(response.status) || type.includes('text/html');
-      if (!limited && type.includes('json')) limited = /rate limit/i.test(await response.clone().text());
-      if (!limited || attempt >= 6) return response;
-      nextSlot = Math.max(nextSlot, Date.now() + Number(process.env.LITMUS_BACKOFF_MS ?? 8000) * (attempt + 1));
-    }
-  };
-}
-
 export class RealChain {
-  constructor({ rpc, retries = 200, intervalMs = 5000 } = {}) {
-    installThrottle(rpc ?? studionet.rpcUrls.default.http[0]);
+  // 5 s polling: the public Studio RPC allows 30 requests per minute for ALL calls of one client, and the timeout
+  // case polls in the background of the other cases, so two pollers at 3 s already exceeded the limit once.
+  constructor({ rpc, retries = 400, intervalMs = 5000 } = {}) {
     this.rpc = rpc;
     this.retries = retries;
     this.intervalMs = intervalMs;
     this.client = createClient({ chain: studionet, ...(rpc ? { endpoint: rpc } : {}) });
     this.isDryRun = false;
+    this.events = [];   // transport hiccups that were retried; the live script copies them into the report notes
   }
   now() { return Date.now(); }
   async sleep(ms) { return sleepReal(ms); }
+  /** Retry transient RPC failures (rate limit, HTML gateway pages) without touching what the call means. */
+  retrying(what, fn, opts = {}) {
+    return retryTransient(fn, {
+      ...opts,
+      sleep: (ms) => this.sleep(ms),
+      onRetry: ({ attempt, attempts, waitMs, error }) => this.events.push(`${what}: transient RPC error (attempt ${attempt}/${attempts}), waiting ${Math.round(waitMs / 1000)} s: ${String(error?.details ?? error?.shortMessage ?? error?.message ?? error).replace(/\s+/g, ' ').slice(0, 120)}`),
+    });
+  }
   newAccount(privateKey) {
     const key = privateKey ?? generatePrivateKey();
     const account = createAccount(key);
     return { address: account.address.toLowerCase(), key, account };
   }
   async fundAccount(address, weiAmount) {
-    await this.client.request({ method: 'sim_fundAccount', params: [address, Number(weiAmount)] });
+    // The RPC takes a JSON number. Refuse an amount that a JS number cannot hold exactly instead of funding a rounded one.
+    const amount = Number(weiAmount);
+    if (!Number.isFinite(amount) || BigInt(amount) !== BigInt(weiAmount)) throw new Error(`fund amount ${weiAmount} is not exactly representable as a JSON number`);
+    await this.retrying('sim_fundAccount', () => this.client.request({ method: 'sim_fundAccount', params: [address, amount] }), { shouldRetry: isRateLimitError });
   }
-  async balance(address) { return BigInt(await this.client.getBalance({ address })); }
+  async balance(address) { return BigInt(await this.retrying('getBalance', () => this.client.getBalance({ address }))); }
   async deploy(code, acct) {
     const hash = await this.client.deployContract({ account: acct.account, code, args: [] });
-    const raw = await this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED, retries: this.retries, interval: this.intervalMs, fullTransaction: true });
+    const raw = await this.retrying('deploy receipt', () => this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED, retries: this.retries, interval: this.intervalMs, fullTransaction: true }));
     const receipt = normalizeReceipt(hash, raw);
     return { receipt, address: receipt.contractAddress, raw };
   }
+  /**
+   * Two phases, because they fail differently:
+   *  1. submit: only an explicit rate-limit refusal is repeated (nothing was accepted). Any other failure is
+   *     ambiguous (the transaction may or may not have reached the chain) and is reported as `submitted: 'maybe'`.
+   *  2. wait: once there is a hash, transient polling errors are retried against the SAME hash, so a rate-limited
+   *     poll can no longer turn an accepted transaction into a "send error".
+   */
   async send(acct, address, fn, args, value = 0n) {
-    let hash = null;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      try {
-        hash = await this.client.writeContract({ account: acct.account, address, functionName: fn, args, value: BigInt(value) });
-        break;
-      } catch (error) {
-        const message = String(error?.message ?? error);
-        // A rate-limited submission was never broadcast, so it is safe to submit again; anything else is surfaced.
-        if (attempt === 3 || !/rate limit/i.test(message)) throw error;
-        await sleepReal(10_000 * (attempt + 1));
-      }
+    let hash;
+    try {
+      hash = await this.retrying(`submit ${fn}`, () => this.client.writeContract({ account: acct.account, address, functionName: fn, args, value: BigInt(value) }), { shouldRetry: isRateLimitError });
+    } catch (error) {
+      error.submitted = isRateLimitError(error) ? 'no' : 'maybe';
+      throw error;
     }
-    // The hash is known from here on: never resubmit, only keep asking for the receipt.
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      try {
-        const raw = await this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED, retries: this.retries, interval: this.intervalMs });
-        return normalizeReceipt(hash, raw);
-      } catch (error) {
-        if (attempt === 9) return { hash, status: 'WAIT_ERROR', executionOk: null, error: String(error?.shortMessage ?? error?.message ?? error).slice(0, 200), votes: [] };
-        await sleepReal(10_000);
-      }
+    try {
+      const raw = await this.retrying(`receipt ${fn}`, () => this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED, retries: this.retries, interval: this.intervalMs }));
+      return normalizeReceipt(hash, raw);
+    } catch (error) {
+      error.txHash = hash; error.submitted = 'yes';
+      throw error;
     }
-    return { hash, status: 'WAIT_ERROR', executionOk: null, error: 'receipt unavailable', votes: [] };
   }
-  /** Polls the transaction until FINALIZED. Transient RPC errors never end the wait early. */
+  /** Resolves to the FINALIZED receipt, or to { finalized: false, status } with the last status the node reports. */
   async waitFinalized(hash, timeoutMs) {
-    const started = Date.now();
-    let last = 'UNKNOWN';
-    while (Date.now() - started < timeoutMs) {
-      try {
-        const summary = normalizeReceipt(hash, await this.client.getTransaction({ hash }));
-        last = summary.status;
-        if (['FINALIZED', 'CANCELED', 'UNDETERMINED'].includes(last)) return { ...summary, waitedSec: Math.round((Date.now() - started) / 1000), timedOut: false };
-      } catch (error) { /* transient: keep waiting */ }
-      await sleepReal(20_000);
+    const retries = Math.max(1, Math.ceil(timeoutMs / this.intervalMs));
+    try {
+      const raw = await this.retrying('finalization wait', () => this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.FINALIZED, retries, interval: this.intervalMs }), { attempts: 3 });
+      return normalizeReceipt(hash, raw);
+    } catch (error) {
+      let status = 'UNKNOWN';
+      try { status = normalizeReceipt(hash, await this.client.getTransaction({ hash })).status; } catch (inner) { /* keep UNKNOWN */ }
+      return { hash, status, finalized: false, error: String(error?.shortMessage ?? error?.message ?? error).slice(0, 160) };
     }
-    return { hash, status: last, waitedSec: Math.round((Date.now() - started) / 1000), timedOut: true };
   }
-  async txStatus(hash) {
-    try { return normalizeReceipt(hash, await this.client.getTransaction({ hash })).status; } catch (error) { return 'UNKNOWN'; }
-  }
-  /** Child transactions created by emitted messages (emit_transfer shows up here on Studio). */
-  async triggered(hash) {
-    const ids = await this.client.getTriggeredTransactionIds({ hash });
-    const out = [];
-    for (const id of ids) {
-      const tx = await this.client.getTransaction({ hash: id });
-      out.push({ id, status: normalizeReceipt(id, tx).status, to: String(tx?.to_address ?? tx?.toAddress ?? tx?.to ?? '').toLowerCase(), value: tx?.value ?? null, type: tx?.type ?? null });
-    }
-    return out;
-  }
+  async transactionStatus(hash) { return normalizeReceipt(hash, await this.retrying('getTransaction', () => this.client.getTransaction({ hash }))).status; }
   async read(address, fn, args = []) {
-    return this.client.readContract({ address, functionName: fn, args });
+    return this.retrying(`read ${fn}`, () => this.client.readContract({ address, functionName: fn, args }));
   }
   async contractCode(address) {
-    const response = await fetch(this.rpc ?? studionet.rpcUrls.default.http[0], {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'gen_getContractCode', params: [address] }),
+    const url = this.rpc ?? studionet.rpcUrls.default.http[0];
+    return this.retrying('gen_getContractCode', async () => {
+      const response = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'gen_getContractCode', params: [address] }),
+      });
+      const text = await response.text();
+      let payload;
+      try { payload = JSON.parse(text); } catch (error) { throw new Error(`gen_getContractCode: HTTP request failed (status ${response.status}), body is not valid JSON: ${text.slice(0, 80)}`); }
+      if (typeof payload.result !== 'string') throw new Error(`gen_getContractCode failed: ${JSON.stringify(payload).slice(0, 200)}`);
+      return Buffer.from(payload.result, 'base64');
     });
-    const payload = await response.json();
-    if (typeof payload.result !== 'string') throw new Error(`gen_getContractCode failed: ${JSON.stringify(payload).slice(0, 200)}`);
-    return Buffer.from(payload.result, 'base64');
   }
 }

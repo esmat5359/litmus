@@ -47,7 +47,7 @@ contract from the agreed `verdict` and `factors` only, so they are equal on ever
 | Layer | What it proves |
 |---|---|
 | `tests/direct/test_equality_law.py` | exhaustive matrix: for 0, 1, 2, 3 aggravating factors and each of PROBE / CASE / APPEAL, every ordered pair of states (BREACH with every flag combination, COMPLIANT, INCONCLUSIVE) is accepted **iff** the two states are identical. Plus named cases for one-step-stricter, one-step-lenient, same severity with different flags, adjacent verdicts, 22 non-canonical leader payloads, reason handling, leader/validator failures. |
-| `tests/direct/test_mutations.py` | 26 mutants of the real source (one-step tolerance, verdict-only, flag-count-only, accept-stricter, accept-more-lenient, adjacent verdicts equal, skipped canonical check, repaired leader output, always-true validator, accept-any-leader-error, plus accounting and funding faults) must all be **killed**. |
+| `tests/direct/test_mutations.py` | 20 mutants of the real source (one-step tolerance, verdict-only, flag-count-only, accept-stricter, accept-more-lenient, adjacent verdicts equal, skipped canonical check, repaired leader output, always-true validator, accept-any-leader-error, plus accounting faults) must all be **killed**. |
 | `tests/test_static_guards.py` | AST: validator has only `==` comparisons on the decision fields; no `abs`, `sum`, `min`, `max`, `len`, ordering, `in`, arithmetic; no `eq_principle`; exactly one model call and one `run_nondet_unsafe`; no storage or clock in the nondeterministic block; state mutated only after `judge()`. |
 | `tests/direct/test_vm_compat.py` | closures pickle (as they must when shipped to validators) and capture plain data only. |
 

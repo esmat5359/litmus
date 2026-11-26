@@ -37,7 +37,7 @@ def test_forge_stores_rule_and_escrows_bond(world):
     ({"unit": 0}, "positive"),
     ({"deposit": 0}, "positive"),
     ({"stake": 2999}, "cover the maximum penalty"),
-    ({"bond": 2999}, "bond must be at least"),
+    ({"bond": 2999}, "below the required minimum"),
     ({"strikes": 0}, "strike limit"),
     ({"strikes": 6}, "strike limit"),
     ({"pass_percent": 74}, "pass percent"),
@@ -206,22 +206,19 @@ def test_retire_and_reclaim_bond(world):
     assert world.audit()["escrow_total"] == "0"
 
 
-def test_enlist_debits_the_ledger_exactly_and_follows_state_rules(world):
+def test_enlist_exact_stake_and_state_rules(world):
     rid = world.forge()
-    world.fund(1, STAKE)
     with world.vm.expect_revert("not certified"):
-        world.call(1, "enlist", rid)
+        world.call(1, "enlist", rid, value=STAKE)
     world.certify(rid=rid)
-    world.fund(2, STAKE - 1)
-    world.fail(2, "enlist", rid, match="insufficient ledger balance")        # one wei short is refused
-    assert world.member(rid, 2) is None and world.claimable(2) == STAKE - 1  # and nothing was taken
-    world.call(1, "enlist", rid)                                              # funded earlier, ledger pays
+    world.fail(1, "enlist", rid, value=STAKE - 1, match="must equal")
+    world.fail(1, "enlist", rid, value=STAKE + 1, match="must equal")
+    world.fail(1, "enlist", rid, value=0, match="must equal")
+    world.enlist(1, rid)
     member = world.member(rid, 1)
     assert member["status"] == "ACTIVE" and member["stake"] == str(STAKE) and world.rule(rid)["members"] == 1
-    assert world.claimable(1) == 0
-    world.fund(1, STAKE)
-    world.fail(1, "enlist", rid, match="already enlisted")
-    assert world.claimable(1) == STAKE                                        # the refused call kept the ledger intact
+    world.fail(1, "enlist", rid, value=STAKE, match="already enlisted")
+    assert world.member(rid, 2) is None
     world.audit()
 
 
@@ -233,8 +230,8 @@ def test_leave_returns_stake_and_allows_reenlist(world):
     assert world.member(rid, 1)["status"] == "LEFT" and world.claimable(1) == STAKE
     assert world.rule(rid)["members"] == 0
     world.fail(1, "leave", rid, match="not a member")
-    world.call(1, "enlist", rid)                       # the released stake is in the ledger: re-enlist needs no new value
-    assert world.member(rid, 1)["status"] == "ACTIVE" and world.rule(rid)["members"] == 1 and world.claimable(1) == 0
+    world.enlist(1, rid)
+    assert world.member(rid, 1)["status"] == "ACTIVE" and world.rule(rid)["members"] == 1
     world.audit()
 
 

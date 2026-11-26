@@ -34,7 +34,7 @@ How the code enforces it (details in [docs/CONSENSUS.md](docs/CONSENSUS.md)):
 * a leader answer must already be in canonical form (exact key set, upper-case enum, real booleans, right
   number of flags, flags only on BREACH); a validator never repairs it;
 * `reason` is bounded free text and never decides anything;
-* the law is locked by an **exhaustive equality matrix**, **26 mutation tests** (tolerances, one-step
+* the law is locked by an **exhaustive equality matrix**, **20 mutation tests** (tolerances, one-step
   acceptance, adjacent verdicts, skipped checks ...) and **AST guards** that fail if the validator ever uses
   `abs`, ordering comparisons, counting or arithmetic.
 
@@ -68,25 +68,13 @@ fully collectable and never partial.
 
 | Write | Who | Notes |
 |---|---|---|
-| **`deposit()` payable** | anyone | the **only** call that accepts value; credits the caller's ledger balance |
-| `forge_rule(title, text, aggravators_json, probes_json, penalty_unit, filing_deposit, enlist_stake, bond, strike_limit, pass_percent, defense_minutes, appeal_minutes)` | anyone | spends `bond` (>= 3 penalty units) from the ledger |
+| `forge_rule(title, text, aggravators_json, probes_json, penalty_unit, filing_deposit, enlist_stake, strike_limit, pass_percent, defense_minutes, appeal_minutes)` payable | anyone | attached value = author bond (>= 3 penalty units) |
 | `revise_rule`, `run_probe`, `certify_rule`, `retire_rule`, `reclaim_bond` | author | probes run once per version; max 2 revisions |
-| `enlist`, `leave` | member | spends the exact stake from the ledger; re-enlist keeps strikes; expelled members can only leave |
-| `file_case`, `submit_defense` | member / defendant | spends the filing deposit; at most 3 open cases per member |
+| `enlist` payable, `leave` | member | exact stake; re-enlist keeps strikes; expelled members can only leave |
+| `file_case` payable, `submit_defense` | member / defendant | at most 3 open cases per member |
 | `rule_case`, `settle_case`, `void_case` | anyone | permissionless once the clock allows |
-| `waive_appeal`, `appeal_case` | the adversely affected party | spends the appeal deposit; fresh judgement without seeing the first ruling |
-| `withdraw` | anyone with a ledger balance | pull-payment; ledger zeroed before the transfer is emitted |
-
-### Funding model: deposit first
-
-Native value enters the contract **only** through `deposit()`. Winnings, released stakes and reclaimed bonds
-land on the same ledger, so they can fund the next action without a round trip through a wallet.
-
-This is not a style choice. The first live Studionet run proved that **a rejected call keeps the value that
-was attached to it** (nine rejected calls stranded exactly 0.0425 GEN, to the wei), and a contract cannot
-refund inside a call that reverts. With deposit-first, the only call that carries value cannot fail once
-value is attached, and every other call carries none, so a mistake costs nothing. A static guard fails the
-build if any other method ever becomes payable.
+| `waive_appeal`, `appeal_case` payable | the adversely affected party | appeal = fresh judgement without seeing the first ruling |
+| `withdraw` | anyone owed money | pull-payment; ledger zeroed before the transfer is emitted |
 
 Views: `get_stats`, `get_limits`, `get_rule`, `list_rules`, `get_case`, `list_cases`, `get_member`,
 `get_claimable`. Amounts are returned as decimal strings, so JavaScript clients never lose wei precision.
@@ -106,11 +94,22 @@ bash scripts/check.sh                   # lint + static guards + Direct Mode sui
 `scripts/check.sh` downloads the exact GenVM **v0.2.16** artifact through `genlayer-test`'s own loader and
 points `GENVMROOT` at it, so the linter and Direct Mode use the real v0.2.16 SDK, not a mock.
 
+### Why GenVM v0.2.16 (and why the toolchain is pinned)
+
+* **GenVM v0.2.16 is the newest release that is not a release candidate.** The v0.3.0 line only exists as
+  `-rc` builds on GitHub, so it is not what a contract that holds money should target. The contract header pins the
+  `py-genlayer` runner that ships inside v0.2.16 (`1jb45aa8...jpz09h6`); a test proves that hash is part of that
+  exact artifact. `latest`, `test` and unversioned runners are rejected by the networks and are never used.
+* The tools are pinned to the versions that produced the committed Studionet run: `genlayer-test 0.29.2`,
+  `genvm-linter 0.11.0`, `genlayer-js 1.1.8`. Newer SDK trains (`genlayer-js 2.x`, `genlayer-test 0.30.x`,
+  `genlayer-py 0.19.x`) were published in the last days of November 2026, change receipt handling, and have no live
+  Litmus run behind them. Upgrade them only together with a fresh `node scripts/live_e2e.mjs` run.
+
 ### Live end-to-end run on Studionet (GitHub Codespaces friendly)
 
 ```bash
-node scripts/live_e2e.mjs                 # full run (45-90 minutes on the public RPC), deploys a fresh contract, writes reports/*.md and *.json
-node scripts/live_e2e.mjs --skip-slow     # skip the two-window timeout case (saves a few minutes)
+node scripts/live_e2e.mjs                 # full run, deploys a fresh contract, writes reports/*.md and *.json
+node scripts/live_e2e.mjs --skip-slow     # skip the timeout case (3-minute defense + 4-minute appeal window)
 node scripts/live_e2e.mjs --dry-run       # same script, no network, in-process model
 ```
 
@@ -125,44 +124,33 @@ verified against **contract state**, language-model steps are retried and report
 | Gate | Result |
 |---|---|
 | `genvm-lint check` against the v0.2.16 runner | passes (24 methods: 8 views, 16 writes) |
-| Direct Mode suite (real v0.2.16 SDK) | 165 tests: lifecycle, validation, payouts, appeals, expulsion, liveness escape, funding model, closures pickle like on the real VM |
+| Direct Mode suite (real v0.2.16 SDK) | 140 tests: lifecycle, validation, payouts, appeals, expulsion, liveness escape, closures pickle like on the real VM |
 | Exact-equality matrix | every (leader, validator) pair of every state for 0-3 factors in PROBE, CASE and APPEAL mode |
-| Mutation tests | 26 deliberately broken contracts, all killed (tolerance, one-step, adjacent verdicts, accounting and funding faults) |
+| Mutation tests | 20 deliberately broken contracts, all killed (tolerance, one-step, adjacent verdicts, accounting faults) |
 | Seeded random walks | 10 walks x 600 steps, books re-audited after every successful call, every outcome reached |
 | Differential replay | the live script's model and accounting oracle replayed on the real Python contract: identical final state |
-| Static guards | validator uses `==` only; one model call site; no storage or time inside the nondeterministic block; only `deposit()` is payable |
+| Static guards | validator uses `==` only; one model call site; no storage or time inside the nondeterministic block |
 
-### First live Studionet run (2026-11-18)
-
-162 checks passed, 0 failed. The validators agreed on **every** model-backed call on the first attempt: all
-five golden probes, all four case rulings (including a BREACH with both aggravating factors) and the appeal,
-each with the designed verdict and flags, so the exact-equality law is workable on the real network with
-these concrete rules. Contract bytes, rule digest (computed independently in JavaScript), every payout, every
-reservation and every counter matched the independent accounting oracle, and a defendant was expelled at the
-third strike. The run also found three things, now fixed or instrumented:
-
-| Finding | Evidence | Resolution |
-|---|---|---|
-| Rejected calls keep their attached value | contract balance exceeded escrow by exactly the sum of nine rejected calls | deposit-first funding model (above); audits now demand balance == escrow exactly |
-| The public RPC allows 30 requests per minute | `Rate limit exceeded` and HTML error pages; one receipt poll failed after the transaction had landed | one throttled request queue, retries of rate-limit answers, and a rule that a known transaction hash is never resubmitted |
-| Withdrawn funds were not seen arriving in the wallets | the contract balance fell by exactly the withdrawn total, wallet balances read +0 | the script now reconciles every wallet (start - sent + withdrawn) and reports the exact gap; see Known limits |
+**Live run:** `reports/live_e2e_studionet_2026-11-18T14-18-08-667Z.md` is a full run on Studionet (contract
+`0x259C458f4f12552dcCa28d7751809d391CACbe10`, deployed bytes equal to `contracts/Litmus.py`): 162 PASS, 0 FAIL,
+15 WARN. Every warning is explained in [docs/LIVE_E2E.md](docs/LIVE_E2E.md); two of them are limits worth knowing:
+value attached to a *rejected* payable call stays in the contract (see below), and wallet credits after `withdraw`
+land on finalization, which that run did not observe (`scripts/verify_withdrawals.mjs` re-checks it later).
 
 ## Known limits (by design)
 
 * **Exact equality costs liveness.** If the validators cannot agree on a vague statement the call fails and
   can be retried; a case that never reaches a quorum can be voided after 7 days. Write concrete rules and
   concrete probes: the clarity gate exists to teach exactly that.
-* Native-token transfers are emitted **on finalization** (the SDK default). In the first live run the contract
-  balance dropped by exactly the withdrawn amount, but the wallet balances had not risen when the run ended
-  (that run's finalization wait could be cut short by any RPC error, and the whole run took 32 minutes, so it cannot have waited the 4 x 10 minutes it was configured for). The script
-  now withdraws early, reads back each emitted transfer message, waits for finalization with a polling loop
-  that no transient RPC error can cut short, and reconciles every wallet; `scripts/check_balances.mjs`
-  answers the same question for a run that is already over.
-* Do not send value to the contract by any means other than `deposit()`: a plain transfer cannot be
-  recovered (the pinned linter does not accept a `__receive__` handler).
+* Native-token transfers are emitted **on finalization**; `withdraw` therefore credits the wallet after the
+  transaction finalizes, not at acceptance.
 * The contract trusts the model only for the closed form described above; it does not fetch web pages. The
   evidence is the text parties submit on-chain.
 * One appeal per case; appeals do not chain.
+* **A rejected payable call does not refund.** On Studionet the value attached to a call the contract rejects
+  (wrong stake or deposit, calling `enlist` twice ...) stays in the contract's native balance: the call is rolled
+  back, the transfer is not, and a contract cannot refund inside a call it reverts. That value is not part of
+  `escrow_total`, nobody is owed it, and it cannot be recovered. Attach exactly the required amount.
 
 ## Layout
 
@@ -174,5 +162,6 @@ scripts/live_e2e.mjs           live Studionet run (+ --dry-run)
 scripts/lib/                   real chain adapter, in-process model, helpers
 scripts/check.sh               every offline gate in one command
 scripts/verify_deployed_source.mjs   byte parity of deployed code vs source
+scripts/verify_withdrawals.mjs       re-check wallet credits of a finished live run after finalization
 docs/                          CONSENSUS, ARCHITECTURE, LIVE_E2E
 ```
