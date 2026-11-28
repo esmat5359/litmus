@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * LITMUS live end-to-end run for GenLayer Studionet (GenVM v0.2.16 contract).
+ * LITMUS live end-to-end run for GenLayer Studionet (GenVM v0.4 contract, Studio v0.123 / Consensus v0.6).
  *
  *   npm ci
  *   node scripts/live_e2e.mjs                 # full run (about 25-40 minutes on Studionet)
@@ -17,7 +17,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bytes, eventually, fmtGen, minBig, parseView, ruleDigest, sha256 } from './lib/common.mjs';
+import { bytes, eventually, fmtGen, isSubsetSum, minBig, parseView, payoutArrived, ruleDigest, sha256 } from './lib/common.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = Object.fromEntries(process.argv.slice(2).map((a) => {
@@ -29,6 +29,9 @@ const SKIP_SLOW = Boolean(argv['skip-slow']);
 const STRICT = Boolean(argv.strict);
 const LLM_ATTEMPTS = Number(argv['llm-attempts'] ?? 3);
 const FINALITY_MIN = Number(argv['finality-timeout-min'] ?? 10);
+const PAYOUT_WAIT_MIN = Number(argv['payout-wait-min'] ?? 5);        // extra wait for a wallet credit AFTER the withdraw transaction finalized
+const REFUND_WAIT_SEC = Number(argv['refund-wait-sec'] ?? 180);      // how long value attached to a rejected payable call may stay in the contract
+const PAYOUTS_WARN_ONLY = Boolean(argv['payouts-warn-only']);        // downgrade "finalized but not credited" from FAIL to WARN
 const OUT_DIR = resolve(ROOT, String(argv['out-dir'] ?? 'reports'));
 const RPC = argv.rpc ?? process.env.GENLAYER_RPC ?? 'https://studio.genlayer.com/api';
 const EXPLORER = 'https://explorer-studio.genlayer.com/tx/';
@@ -96,11 +99,14 @@ const claimable = async (who) => BigInt(await view('get_claimable', [wallet(who)
 const stats = async () => view('get_stats');
 const until = (fn, timeoutMs = 90_000) => eventually(fn, { timeoutMs, intervalMs: DRY ? 2_500 : 4_000, sleep: (ms) => chain.sleep(ms), now: () => chain.now() });
 
-// Value attached to payable calls that the contract rejected. Studionet keeps it in the contract's native balance
-// (the call is rolled back, the transfer is not), so the audit must expect it instead of calling it a mystery.
+// Value attached to payable calls that the contract rejected. Studionet has been seen to treat it in two ways:
+//   'refunded': the contract holds it until the rejected transaction finalizes, then it goes back to the sender
+//               (run of 2026-11-26: every audit that waited saw balance == escrow again, and the senders' wallets only lost fees)
+//   'kept':     it stays in the contract's native balance for good (run of 2026-11-18, which did not wait for finalization)
+// The audit therefore never assumes either: it waits for the balance to settle and only then names what is left.
 //   confirmed: rejection proven by a receipt with a hash and exec=false
 //   maybe:     the submission failed ambiguously (e.g. a gateway page) and may or may not have reached the chain
-const retained = { confirmed: 0n, maybe: 0n, observedRetention: null };
+const retained = { confirmed: 0n, maybe: 0n, values: [], mode: 'unknown' };   // mode: unknown | refunded | kept
 
 async function tx(label, who, fn, args, opts = {}) {
   const { value = 0n, kind = 'det', expectFail = false, verify = null, unchanged = null } = opts;
@@ -125,12 +131,12 @@ async function tx(label, who, fn, args, opts = {}) {
       if (!stayed) { check('FAIL', `${label} should have been rejected but state changed`, detail); return { ok: false, receipt }; }
       if (reachedChain && receipt.executionOk === true) { check('FAIL', `${label} should have been rejected but executed successfully`, detail); return { ok: false, receipt }; }
       if (reachedChain && receipt.executionOk === false) {
-        if (value > 0n) retained.confirmed += value;
+        if (value > 0n) { retained.confirmed += value; retained.values.push(value); }
         check('PASS', `${label} (rejected, state unchanged)`, detail);
         return { ok: true, receipt };
       }
       // No receipt (transport error) or no readable execution result: the rejection is not proven.
-      if (!reachedChain && value > 0n && receipt.submitted !== 'no') retained.maybe += value;
+      if (!reachedChain && value > 0n && receipt.submitted !== 'no') { retained.maybe += value; retained.values.push(value); }
       if (attempt < attempts) {
         check('WARN', `${label}: attempt ${attempt}/${attempts} gave no proof of rejection`, `${detail}; repeating the call so the rejection is proven by a receipt`);
         await chain.sleep(reachedChain ? 1_000 : 8_000);
@@ -177,13 +183,33 @@ async function audit(label) {
   check(okClaim && okEscrow ? 'PASS' : 'FAIL', `audit ${label}: books balance`,
     `escrow=${s.escrow_total} recomputed=${held} claimable=${s.claimable_total}/${claim} contract_balance=${bal ?? 'unavailable'}`);
   const escrow = BigInt(s.escrow_total);
-  const kept = retained.observedRetention === true ? retained.confirmed : 0n;       // value the network kept from rejected calls
-  const slack = retained.observedRetention === true ? retained.maybe : 0n;          // ... plus submissions we could not confirm
-  if (bal === null) check('WARN', `audit ${label}: contract balance could not be read from the RPC`, 'native balance comparison skipped');
-  else if (bal < escrow) check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${bal} < escrow ${s.escrow_total}`);
-  else if (bal === escrow + kept) check('PASS', `audit ${label}: contract balance equals escrow${kept > 0n ? ' + value retained by rejected calls' : ''}`, `balance ${bal} = escrow ${escrow}${kept > 0n ? ` + retained ${kept}` : ''}`);
-  else if (bal > escrow + kept && bal <= escrow + kept + slack) check('WARN', `audit ${label}: contract balance explained only with unconfirmed submissions`, `balance ${bal} = escrow ${escrow} + retained ${kept} + up to ${slack} from submissions whose receipt was lost`);
-  else check('WARN', `audit ${label}: contract balance differs from escrow + retained value`, `balance ${bal}, escrow ${escrow}, retained by rejected calls ${kept} (unexplained difference ${bal - escrow - kept})`);
+  if (bal === null) { check('WARN', `audit ${label}: contract balance could not be read from the RPC`, 'native balance comparison skipped'); return { stats: s, rules, cases }; }
+  if (bal < escrow) { check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${bal} < escrow ${s.escrow_total}`); return { stats: s, rules, cases }; }
+  if (retained.mode === 'kept') {
+    // this network was proven to keep the value of rejected payable calls: expect exactly that on top of the escrow
+    const kept = retained.confirmed; const slack = retained.maybe;
+    if (bal === escrow + kept) check('PASS', `audit ${label}: contract balance equals escrow + value retained by rejected calls`, `balance ${bal} = escrow ${escrow} + retained ${kept}`);
+    else if (bal > escrow + kept && bal <= escrow + kept + slack) check('WARN', `audit ${label}: contract balance explained only with unconfirmed submissions`, `balance ${bal} = escrow ${escrow} + retained ${kept} + up to ${slack} from submissions whose receipt was lost`);
+    else check('WARN', `audit ${label}: contract balance differs from escrow + retained value`, `balance ${bal}, escrow ${escrow}, retained by rejected calls ${kept} (unexplained difference ${bal - escrow - kept})`);
+    return { stats: s, rules, cases };
+  }
+  if (bal === escrow) { check('PASS', `audit ${label}: contract balance equals escrow`, `balance ${bal} = escrow ${escrow}`); return { stats: s, rules, cases }; }
+  // Something above the escrow: value of a rejected payable call that is still in flight? Wait for finalization before judging.
+  const stray = bal - escrow;
+  const settled = await until(async () => (await chain.balance(address)) === escrow, REFUND_WAIT_SEC * 1000);
+  if (settled) {
+    retained.mode = 'refunded';
+    check('PASS', `audit ${label}: contract balance equals escrow once rejected-call value was returned`, `${stray} wei above the escrow at the first read; balance = escrow ${escrow} after finalization`);
+    return { stats: s, rules, cases };
+  }
+  const now = await chain.balance(address); const extra = now - escrow;
+  if (extra < 0n) check('FAIL', `audit ${label}: contract balance covers escrow`, `balance ${now} < escrow ${escrow}`);
+  else if (extra === 0n) check('PASS', `audit ${label}: contract balance equals escrow`, `balance ${now} = escrow ${escrow}`);
+  else if (extra === retained.confirmed && retained.confirmed > 0n) {
+    retained.mode = 'kept';
+    check('INFO', `audit ${label}: this network keeps the value of rejected payable calls`, `${extra} wei is still above the escrow ${REFUND_WAIT_SEC} s later and equals the value attached to every rejected payable call so far; from here on the audit expects balance = escrow + retained value`);
+  } else if (isSubsetSum(retained.values, extra)) check('WARN', `audit ${label}: value of rejected payable calls not returned within ${REFUND_WAIT_SEC} s`, `balance ${now} = escrow ${escrow} + ${extra}, which is the sum of some rejected payable calls; re-read later to see whether it is refunded`);
+  else check('WARN', `audit ${label}: contract balance differs from escrow`, `balance ${now}, escrow ${escrow} (unexplained difference ${extra}; value attached to rejected payable calls so far: ${retained.confirmed})`);
   return { stats: s, rules, cases };
 }
 
@@ -206,13 +232,19 @@ function expectedSettlement(r, c, bondBefore) {
 
 // ------------------------------------------------------------------------------------------ scenario steps
 async function setup() {
-  chain = DRY ? new (await import('./lib/mock_chain.mjs')).MockChain({ flipAppeals: Boolean(argv['flip-appeals']), retainRejectedValue: Boolean(argv['retain-rejected']), flakyRpc: Boolean(argv['flaky-rpc']) })
+  chain = DRY ? new (await import('./lib/mock_chain.mjs')).MockChain({ flipAppeals: Boolean(argv['flip-appeals']), retainRejectedValue: Boolean(argv['retain-rejected']), refundRejectedLate: Boolean(argv['refund-rejected-late']),
+    lateTransfers: Boolean(argv['late-transfers']), lostTransfers: Boolean(argv['lost-transfers']), flakyRpc: Boolean(argv['flaky-rpc']) })
     : new (await import('./lib/real_chain.mjs')).RealChain({ rpc: RPC });
   if (!DRY) {
     try { await chain.balance('0x' + '0'.repeat(40)); } catch (error) {
       throw new Abort(`cannot reach the GenLayer RPC at ${RPC}: ${String(error?.shortMessage ?? error?.message ?? error).split('\n')[0]}. Check network access, or pass --rpc=<url>.`);
     }
     check('PASS', 'RPC reachable', RPC);
+    try {
+      const id = await chain.chainId();
+      if (id === 61999) check('PASS', 'chain id is 61999 (Studionet, Studio v0.123 / Consensus v0.6)', RPC);
+      else check('WARN', `chain id is ${id}, not 61999 (Studionet)`, `${RPC} is another network (61997 is studio-dev / studio-next); the contract targets the GenVM v0.4 runner`);
+    } catch (error) { check('WARN', 'chain id could not be read', String(error?.message ?? error).slice(0, 100)); }
   }
   const names = ['author', 'plaintiff', 'defendant', 'observer', 'outsider'];
   const keys = (process.env.LITMUS_KEYS ?? '').split(',').map((k) => k.trim()).filter(Boolean);
@@ -232,6 +264,7 @@ async function setup() {
     }
   }
   check('PASS', 'accounts created and funded', names.map((n) => `${n}=${ACCTS[n].address}`).join(' '));
+  if (chain.diagnostics) check('INFO', 'network diagnostics before deploy', JSON.stringify(await chain.diagnostics(ACCTS.author.address)));
 }
 
 async function deploy() {
@@ -278,16 +311,9 @@ async function forgeAndCertify() {
   await tx('forge_rule rejects a stake that cannot cover the maximum penalty', ACCTS.author, 'forge_rule', forgeArgs({ stake: 3n * UNIT - 1n }), { value: BOND, expectFail: true, unchanged: async () => (await stats()).rules === 0 });
   let after = null;
   try { after = await chain.balance(address); } catch (error) { after = null; }
+  const attached = retained.confirmed - confirmedBefore;
   if (before === null || after === null) check('INFO', 'value attached to rejected payable calls', 'contract balance unavailable from the RPC');
-  else if (after === before) {
-    retained.observedRetention = false;
-    check('INFO', 'value attached to rejected payable calls', 'contract balance unchanged: rejected calls do not retain value');
-  } else {
-    retained.observedRetention = true;
-    const tracked = retained.confirmed - confirmedBefore;
-    check(after - before === tracked ? 'INFO' : 'WARN', 'value attached to rejected payable calls is retained by this network',
-      `contract balance rose by ${after - before} wei across the three rejected forges; the script attached ${tracked} wei to them${after - before === tracked ? ' (exact match). From here on the audit expects balance = escrow + retained value.' : ' (mismatch)'}`);
-  }
+  else check('INFO', 'contract balance right after the three rejected forges', `${after - before} wei above the balance before them; the script attached ${attached} wei to them. The audit below waits for finalization and then says whether that value was returned or kept.`);
 
   const forged = await tx('forge_rule (main rule)', ACCTS.author, 'forge_rule', forgeArgs(), { value: BOND, verify: async () => (await stats()).rules === 1 });
   if (!forged.ok) throw new Abort('rule could not be forged');
@@ -465,7 +491,6 @@ async function exitFlow() {
 
 async function withdrawAll() {
   const pending = [];
-  const contractBefore = await chain.balance(address);
   let withdrawn = 0n;
   for (const [name, acct] of Object.entries(ACCTS)) {
     const amount = await claimable(acct);
@@ -477,48 +502,67 @@ async function withdrawAll() {
   }
   await tx('withdraw rejected when nothing is owed', ACCTS.outsider, 'withdraw', [], { expectFail: true, unchanged: async () => true });
 
-  // 1. Contract side, provable right away: the native balance left the contract.
-  const dropped = await until(async () => (await chain.balance(address)) === contractBefore - withdrawn, 120_000);
-  check(dropped ? 'PASS' : 'WARN', 'contract balance fell by exactly the amount withdrawn', dropped
-    ? `${contractBefore} - ${withdrawn} = ${contractBefore - withdrawn}`
-    : `expected ${contractBefore - withdrawn}, saw ${await chain.balance(address)}`);
-
-  // 2. Wallet side: the native transfer is emitted on finalization, so say what the withdraw transaction's status was.
+  // Native transfers are applied when the withdraw transaction FINALIZES, on the contract side (its balance falls) and on the wallet side
+  // (the recipient is credited) together. So: wait for finalization first, then give the payout time to show up, then judge.
   for (const p of pending) {
     const fin = p.hash ? await chain.waitFinalized(p.hash, FINALITY_MIN * 60_000) : null;
     p.finalStatus = fin ? fin.status : 'NO_HASH';
-    const credited = await until(async () => (await chain.balance(p.acct.address)) >= p.balBefore + p.amount, 120_000);
-    const now = await chain.balance(p.acct.address);
-    const finalized = p.finalStatus === 'FINALIZED';
-    check(credited ? 'PASS' : 'WARN', `${p.name}: wallet balance received the withdrawal`, credited
-      ? `+${now - p.balBefore} wei (withdraw tx ${p.finalStatus})`
-      : `expected +${p.amount} wei, saw +${now - p.balBefore} wei; withdraw tx is ${p.finalStatus}${finalized ? ' (finalized, so the wallet should have been credited)' : ` (not FINALIZED within ${FINALITY_MIN} min; transfers are emitted on finalization, re-check with: node scripts/verify_withdrawals.mjs <report.json>)`}`);
   }
-  report.withdrawals = pending.map((p) => ({ name: p.name, address: p.acct.address, amount: p.amount, balanceBefore: p.balBefore, hash: p.hash, finalStatus: p.finalStatus }));
+  let notDelivered = 0n; let waitMs = PAYOUT_WAIT_MIN * 60_000;
+  for (const p of pending) {
+    const credited = await until(async () => payoutArrived(p.balBefore, await chain.balance(p.acct.address), p.amount), waitMs);
+    if (!credited) waitMs = 30_000;   // transfers of one finalization batch arrive together: do not wait the full time for every wallet
+    const now = await chain.balance(p.acct.address);
+    p.net = now - p.balBefore;
+    const finalized = p.finalStatus === 'FINALIZED';
+    if (credited) { check('PASS', `${p.name}: wallet balance received the withdrawal`, `net ${p.net >= 0n ? '+' : ''}${p.net} wei for ${p.amount} withdrawn (the difference is the transaction fee); withdraw tx ${p.finalStatus}`); continue; }
+    if (finalized) {
+      notDelivered += p.amount;
+      const feePath = [...(chain.events ?? [])].reverse().find((e) => String(e).startsWith('fees(withdraw)')) ?? 'not recorded';
+      check(PAYOUTS_WARN_ONLY ? 'WARN' : 'FAIL', `${p.name}: withdraw finalized but the wallet was not credited`,
+        `expected about +${p.amount} wei, net change ${p.net} wei ${PAYOUT_WAIT_MIN} min after finalization. The contract already cleared the ledger, so this money is owed and not delivered. Re-check later with: node scripts/verify_withdrawals.mjs <report.json>; fee parameters of the withdraw: ${feePath}`);
+    } else {
+      check('WARN', `${p.name}: wallet balance not credited yet`, `expected +${p.amount} wei, net change ${p.net} wei; withdraw tx is ${p.finalStatus} (not FINALIZED within ${FINALITY_MIN} min; transfers are applied on finalization, re-check with: node scripts/verify_withdrawals.mjs <report.json>)`);
+    }
+  }
+  report.withdrawals = pending.map((p) => ({ name: p.name, address: p.acct.address, amount: p.amount, balanceBefore: p.balBefore, hash: p.hash, finalStatus: p.finalStatus, netChange: p.net ?? null }));
 
   const s = await stats();
   assertEq('escrow is zero after full wind-down', s.escrow_total, 0);
   assertEq('claimable is zero after full wind-down', s.claimable_total, 0);
-  const kept = retained.observedRetention === true ? retained.confirmed : 0n;
+  const kept = retained.mode === 'kept' ? retained.confirmed : 0n;
   try {
-    const settled = await until(async () => { const b = await chain.balance(address); return b >= kept && b <= kept + (retained.observedRetention === true ? retained.maybe : 0n); }, 120_000);
+    const settled = await until(async () => (await chain.balance(address)) === kept, REFUND_WAIT_SEC * 1000);
     const bal = await chain.balance(address);
-    if (bal === kept) {
+    if (settled) {
       check('PASS', kept === 0n ? 'contract balance is zero after full wind-down' : 'contract balance after wind-down equals exactly the value retained by rejected calls', `balance ${bal}`);
-    } else if (settled) {
-      check('WARN', 'contract balance after wind-down is explained only with unconfirmed submissions', `balance ${bal} = retained ${kept} + ${bal - kept} wei from submissions whose receipt was lost (nobody is owed this; it is value attached to calls that were rejected)`);
+    } else if (notDelivered > 0n && bal === kept + notDelivered) {
+      check(PAYOUTS_WARN_ONLY ? 'WARN' : 'FAIL', 'contract balance after wind-down still holds the withdrawn money', `balance ${bal} = ${notDelivered} wei of finalized withdrawals that never left the contract${kept > 0n ? ` + ${kept} retained` : ''}`);
+    } else if (bal > kept && isSubsetSum(retained.values, bal - kept)) {
+      check('WARN', 'contract balance after wind-down is explained only by rejected payable calls', `balance ${bal} = ${kept} + ${bal - kept} wei, a sum of rejected payable calls that was not returned within ${REFUND_WAIT_SEC} s (nobody is owed it)`);
     } else {
-      check('WARN', 'contract balance after wind-down is not explained by retained value', `balance ${bal}, retained by confirmed rejected calls ${kept}, unconfirmed submissions ${retained.maybe} (outside every explained range)`);
+      check('WARN', 'contract balance after wind-down is not explained', `balance ${bal}; retained ${kept}; withdrawals not delivered ${notDelivered}; value attached to rejected payable calls ${retained.confirmed} (+${retained.maybe} unconfirmed)`);
     }
-    if (kept > 0n) check('INFO', 'value left behind by rejected payable calls (not owed to anyone, not recoverable)', `${kept} wei was attached to calls the contract rejected and rolled back; this network keeps it in the contract's native balance. Attach the exact required amount: a rejected call does not refund.`);
+    if (retained.mode === 'kept') check('INFO', 'value left behind by rejected payable calls (not owed to anyone, not recoverable)', `${kept} wei was attached to calls the contract rejected and rolled back; this network kept it. Attach the exact required amount.`);
+    if (retained.mode === 'refunded') check('INFO', 'value attached to rejected payable calls was returned', `${retained.confirmed} wei in total was attached to rejected calls and came back after finalization (the contract balance returned to the escrow). Attach the exact required amount anyway: it is only held until then.`);
   } catch (error) { check('WARN', 'contract balance could not be read after wind-down', String(error?.message ?? error).slice(0, 120)); }
 }
 
 // ------------------------------------------------------------------------------------------ main
+/** Revert reasons live in the nested causes of a viem error; the first stack lines alone hide them. */
+function describeError(error) {
+  const parts = [];
+  for (let e = error, depth = 0; e && depth < 5; e = e.cause, depth += 1) {
+    const text = [e.shortMessage, e.details, e.reason, e.data ? `data=${typeof e.data === 'string' ? e.data : JSON.stringify(e.data)}` : null, ...(e.metaMessages ?? [])].filter(Boolean).join(' / ');
+    if (text) parts.push(text.replace(/\s+/g, ' ').slice(0, 300));
+  }
+  return parts.length > 0 ? parts.join(' <- caused by: ') : String(error?.stack ?? error).split('\n').slice(0, 3).join(' | ');
+}
+
 async function writeReport(error) {
   report.finishedAt = new Date().toISOString();
   for (const event of chain?.events ?? []) report.notes.push(`rpc: ${event}`);
-  report.retainedValue = { observedRetention: retained.observedRetention, confirmedWei: retained.confirmed, unconfirmedWei: retained.maybe };
+  report.retainedValue = { mode: retained.mode, observedRetention: retained.mode === 'kept' ? true : retained.mode === 'refunded' ? false : null, confirmedWei: retained.confirmed, unconfirmedWei: retained.maybe };
   report.summary = { ...COUNT, aborted: error ? String(error.message ?? error) : null, hardFailures: COUNT.FAIL + (STRICT ? COUNT.WARN : 0) };
   mkdirSync(OUT_DIR, { recursive: true });
   const stamp = report.startedAt.replace(/[:.]/g, '-');
@@ -561,7 +605,7 @@ async function main() {
   } catch (error) {
     failure = error;
     if (error instanceof Abort) check('FAIL', 'run aborted', error.message);
-    else { check('FAIL', 'unexpected error', error?.stack?.split('\n').slice(0, 3).join(' | ') ?? String(error)); }
+    else { check('FAIL', 'unexpected error', describeError(error)); }
   }
   await writeReport(failure);
   const hard = COUNT.FAIL + (STRICT ? COUNT.WARN : 0);

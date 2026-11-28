@@ -2,7 +2,7 @@
 
 **Rules that must pass their own test before they are allowed to rule.**
 
-Litmus is a GenLayer Intelligent Contract (GenVM **v0.2.16**, built for **Studionet**) for communities that
+Litmus is a GenLayer Intelligent Contract (GenVM **v0.4**, built for **Studionet** on Studio v0.123 / Consensus v0.6) for communities that
 enforce written rules with money at stake. Most on-chain "AI court" contracts let any text become a rule and
 then trust the model to interpret it. Litmus turns that around:
 
@@ -85,25 +85,15 @@ Full state machines, record layouts and arithmetic: [docs/ARCHITECTURE.md](docs/
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt     # genlayer-test 0.29.2, genvm-linter 0.11.0, pytest
-npm ci                                  # genlayer-js 1.1.8 (only needed for the live script)
+pip install -r requirements-dev.txt     # genlayer-test 0.30.0, genvm-linter 0.11.1rc2, pytest
+npm ci                                  # genlayer-js 2.1.0 (only needed for the live script)
 
 bash scripts/check.sh                   # lint + static guards + Direct Mode suite + dry run
 ```
 
-`scripts/check.sh` downloads the exact GenVM **v0.2.16** artifact through `genlayer-test`'s own loader and
-points `GENVMROOT` at it, so the linter and Direct Mode use the real v0.2.16 SDK, not a mock.
-
-### Why GenVM v0.2.16 (and why the toolchain is pinned)
-
-* **GenVM v0.2.16 is the newest release that is not a release candidate.** The v0.3.0 line only exists as
-  `-rc` builds on GitHub, so it is not what a contract that holds money should target. The contract header pins the
-  `py-genlayer` runner that ships inside v0.2.16 (`1jb45aa8...jpz09h6`); a test proves that hash is part of that
-  exact artifact. `latest`, `test` and unversioned runners are rejected by the networks and are never used.
-* The tools are pinned to the versions that produced the committed Studionet run: `genlayer-test 0.29.2`,
-  `genvm-linter 0.11.0`, `genlayer-js 1.1.8`. Newer SDK trains (`genlayer-js 2.x`, `genlayer-test 0.30.x`,
-  `genlayer-py 0.19.x`) were published in the last days of November 2026, change receipt handling, and have no live
-  Litmus run behind them. Upgrade them only together with a fresh `node scripts/live_e2e.mjs` run.
+`scripts/check.sh` sets `GENVM_VERSION=v0.6.0-rc14` (the GenVM release Studio v0.123 pins; executor line **v0.4**,
+runner `py-genlayer:kzybg95x...`) and pre-downloads it, so the linter and Direct Mode use the real v0.4 SDK, not a mock.
+genvm-linter 0.11.0 cannot load that runner, hence the `0.11.1rc2` pin.
 
 ### Live end-to-end run on Studionet (GitHub Codespaces friendly)
 
@@ -123,19 +113,23 @@ verified against **contract state**, language-model steps are retried and report
 
 | Gate | Result |
 |---|---|
-| `genvm-lint check` against the v0.2.16 runner | passes (24 methods: 8 views, 16 writes) |
-| Direct Mode suite (real v0.2.16 SDK) | 140 tests: lifecycle, validation, payouts, appeals, expulsion, liveness escape, closures pickle like on the real VM |
+| `genvm-lint check` against the v0.4 runner | **to run** with `bash scripts/check.sh` (passed on the v0.2.16 runner before the port: 24 methods, 8 views, 16 writes) |
+| Direct Mode suite (real v0.4 SDK) | **to run** with `bash scripts/check.sh` (139 tests on v0.2.16 before the port: lifecycle, validation, payouts, appeals, expulsion, liveness escape, closures pickle like on the real VM) |
 | Exact-equality matrix | every (leader, validator) pair of every state for 0-3 factors in PROBE, CASE and APPEAL mode |
 | Mutation tests | 20 deliberately broken contracts, all killed (tolerance, one-step, adjacent verdicts, accounting faults) |
 | Seeded random walks | 10 walks x 600 steps, books re-audited after every successful call, every outcome reached |
 | Differential replay | the live script's model and accounting oracle replayed on the real Python contract: identical final state |
-| Static guards | validator uses `==` only; one model call site; no storage or time inside the nondeterministic block |
+| Static guards (offline, 15 checks) | validator uses `==` only; one model call site; no storage or time inside the nondeterministic block; the v0.4 rules (header, imports, no removed APIs, no `__receive__`, no decorators on special methods, storage types, `gl.chain.Account` transfers only in `withdraw`) |
 
-**Live run:** `reports/live_e2e_studionet_2026-11-18T14-18-08-667Z.md` is a full run on Studionet (contract
-`0x259C458f4f12552dcCa28d7751809d391CACbe10`, deployed bytes equal to `contracts/Litmus.py`): 162 PASS, 0 FAIL,
-15 WARN. Every warning is explained in [docs/LIVE_E2E.md](docs/LIVE_E2E.md); two of them are limits worth knowing:
-value attached to a *rejected* payable call stays in the contract (see below), and wallet credits after `withdraw`
-land on finalization, which that run did not observe (`scripts/verify_withdrawals.mjs` re-checks it later).
+**Live run (before the v0.4 port, GenVM v0.2 contract):** `reports/live_e2e_studionet_2026-11-26T14-41-12-921Z.md` is a `--skip-slow` run on Studionet (contract
+`0x57A3125911B84944CBE8148A34e715f98f215F81`, deployed bytes equal to `contracts/Litmus.py`): 144 PASS, 0 FAIL, 12 WARN.
+Every contract-state check passed. The 12 warnings came from the *script*, not from the contract: seven came from a wrong
+model of the value attached to rejected payable calls (it is held and **returned after finalization**, not kept), and five
+concern the payout of `withdraw` (the wallets were not credited although the transactions finalized, and the old
+comparison could not have succeeded anyway because it ignored the transaction fee). The script was fixed afterwards
+(see [docs/LIVE_E2E.md](docs/LIVE_E2E.md)); **a payout that finalizes without reaching the wallet is now a FAIL**, and
+whether Studionet really delivers the transfers is still to be confirmed by a new run and
+`npm run verify:withdrawals -- reports/<report>.json`.
 
 ## Known limits (by design)
 
@@ -147,10 +141,12 @@ land on finalization, which that run did not observe (`scripts/verify_withdrawal
 * The contract trusts the model only for the closed form described above; it does not fetch web pages. The
   evidence is the text parties submit on-chain.
 * One appeal per case; appeals do not chain.
-* **A rejected payable call does not refund.** On Studionet the value attached to a call the contract rejects
-  (wrong stake or deposit, calling `enlist` twice ...) stays in the contract's native balance: the call is rolled
-  back, the transfer is not, and a contract cannot refund inside a call it reverts. That value is not part of
-  `escrow_total`, nobody is owed it, and it cannot be recovered. Attach exactly the required amount.
+* **Attach exactly the required amount to payable calls.** When the contract rejects a payable call (wrong stake or
+  deposit, calling `enlist` twice ...) the call is rolled back and a contract cannot refund inside a call it reverts.
+  On Studionet the attached value sits in the contract's native balance until the rejected transaction finalizes; the
+  run of 2026-11-26 saw it returned to the sender after finalization (the senders' wallets only lost fees), the run of
+  2026-11-18 saw it stay. It is never part of `escrow_total` and nobody is owed it by the contract, so do not depend on
+  getting it back.
 
 ## Layout
 

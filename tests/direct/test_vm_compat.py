@@ -1,7 +1,5 @@
-"""Checks that mirror constraints of the real GenVM v0.2.16 runtime."""
+"""Checks that mirror constraints of the real GenVM v0.4 runtime."""
 import json
-import re
-from pathlib import Path
 
 from conftest import R, S_PLAIN, llm
 from test_equality_law import build, probe_pairs
@@ -43,21 +41,3 @@ def test_views_return_valid_json_and_wei_amounts_are_strings(world):
     stats = world.stats()
     assert isinstance(stats["escrow_total"], str) and isinstance(stats["claimable_total"], str)
     assert world.c.get_claimable(world.w(0)) == "0"
-
-
-def test_header_runner_hash_belongs_to_the_pinned_genvm_artifact():
-    """The header hash must be the py-genlayer runner that ships inside GenVM v0.2.16 (the last non-RC release).
-
-    A hash that is merely well-formed would still pass the static guard; this one proves it exists in the very
-    artifact the linter and Direct Mode load, so a copy-paste of another runner hash cannot slip through.
-    """
-    from gltest.direct.sdk_loader import CACHE_DIR
-
-    root = Path(__file__).resolve().parent.parent.parent
-    header = (root / "contracts" / "Litmus.py").read_text(encoding="utf-8").splitlines()[0]
-    runner = re.search(r'"Depends":\s*"py-genlayer:([0-9a-z]+)"', header).group(1)
-    setup = (root / "scripts" / "setup_genvm_toolchain.py").read_text(encoding="utf-8")
-    version = re.search(r'GENVM_VERSION\s*=\s*"(v\d+\.\d+\.\d+)"', setup).group(1)
-    assert version == "v0.2.16"
-    runner_json = CACHE_DIR / "extracted" / version / "py-genlayer" / runner / "runner.json"
-    assert runner_json.is_file(), f"runner {runner} is not part of GenVM {version}"

@@ -1,5 +1,5 @@
-// Real Studionet adapter built on genlayer-js 1.1.8 (the version pinned in package.json).
-import { createClient, createAccount, generatePrivateKey } from 'genlayer-js';
+// Real Studionet adapter built on genlayer-js 2.1.0 (the version pinned in package.json).
+import { createClient, createAccount, generatePrivateKey, createFeesDistribution } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
 import { TransactionStatus } from 'genlayer-js/types';
 import { isRateLimitError, retryTransient, sleepReal } from './common.mjs';
@@ -53,6 +53,9 @@ function findContractAddress(r) {
   return typeof to === 'string' && /^0x[0-9a-fA-F]{40}$/.test(to) && !/^0x0{40}$/.test(to) ? to : null;
 }
 
+// Contract methods whose execution emits a message (native transfer). Keep in sync with emit_transfer() in contracts/Litmus.py.
+const EMITS_MESSAGES = new Set(['withdraw']);
+
 export class RealChain {
   // 5 s polling: the public Studio RPC allows 30 requests per minute for ALL calls of one client, and the timeout
   // case polls in the background of the other cases, so two pollers at 3 s already exceeded the limit once.
@@ -62,7 +65,7 @@ export class RealChain {
     this.intervalMs = intervalMs;
     this.client = createClient({ chain: studionet, ...(rpc ? { endpoint: rpc } : {}) });
     this.isDryRun = false;
-    this.events = [];   // transport hiccups that were retried; the live script copies them into the report notes
+    this.events = []; this.cachedFeeConfig = null;   // transport hiccups that were retried; the live script copies them into the report notes
   }
   now() { return Date.now(); }
   async sleep(ms) { return sleepReal(ms); }
@@ -80,14 +83,54 @@ export class RealChain {
     return { address: account.address.toLowerCase(), key, account };
   }
   async fundAccount(address, weiAmount) {
-    // The RPC takes a JSON number. Refuse an amount that a JS number cannot hold exactly instead of funding a rounded one.
-    const amount = Number(weiAmount);
-    if (!Number.isFinite(amount) || BigInt(amount) !== BigInt(weiAmount)) throw new Error(`fund amount ${weiAmount} is not exactly representable as a JSON number`);
-    await this.retrying('sim_fundAccount', () => this.client.request({ method: 'sim_fundAccount', params: [address, amount] }), { shouldRetry: isRateLimitError });
+    await this.client.request({ method: 'sim_fundAccount', params: [address, Number(weiAmount)] });
   }
+  /** Facts that explain a failed deploy. Every item is best effort: a method this Studio does not offer is skipped. */
+  async diagnostics(address) {
+    const out = {};
+    const ask = async (key, fn) => { try { out[key] = await fn(); } catch (error) { out[key] = `unavailable (${String(error?.shortMessage ?? error?.message ?? error).replace(/\s+/g, ' ').slice(0, 80)})`; } };
+    await ask('chainId', async () => this.client.request({ method: 'eth_chainId' }));
+    await ask('validators', async () => this.client.request({ method: 'sim_countValidators', params: [] }));
+    await ask('deployerBalanceWei', async () => String(await this.client.getBalance({ address })));
+    return out;
+  }
+  // v0.6 fee model: every write carries fees {distribution, feeValue}. A call that can emit a funded message (here: the
+  // native transfer of withdraw) must also carry messageAllocations, which only a write simulation can tell. Calls that
+  // emit nothing use the network's default fee config (a simulation of the LLM-judging calls would run the model twice).
+  async getV06TxParams(fn="",acct=null,address=null,args=[],value=0n){
+    if(EMITS_MESSAGES.has(fn)){
+      // withdraw emits a native transfer; if the fee estimate (which carries the message allocation for that transfer) is
+      // silently replaced by the default fee config, the transfer may never be applied. Say which path was taken.
+      if(address&&typeof this.client.estimateTransactionFeesForWrite==="function"){
+        for(let attempt=1;attempt<=2;attempt+=1){
+          try{
+            const est=await this.client.estimateTransactionFeesForWrite({account:acct?.account,address,functionName:fn,args,value:BigInt(value)});
+            this.events.push(`fees(withdraw): estimated, ${est.messageAllocations?.length??0} message allocation(s), feeValue ${est.feeValue}`);
+            return{gas:500000n,fees:{distribution:est.distribution,...(est.messageAllocations?.length?{messageAllocations:est.messageAllocations}:{}),feeValue:est.feeValue}};
+          }catch(e){
+            if(isRateLimitError(e))throw e;
+            this.events.push(`fees(withdraw): estimate failed (attempt ${attempt}/2): ${String(e?.shortMessage??e?.message??e).replace(/\s+/g," ").slice(0,160)}`);
+            if(attempt<2)await this.sleep(3000);
+          }
+        }
+        this.events.push("fees(withdraw): fell back to the default fee config WITHOUT message allocations; the emitted native transfer may not be funded");
+      }else{
+        this.events.push("fees(withdraw): estimateTransactionFeesForWrite is not available in this genlayer-js; using the default fee config");
+      }
+    }
+    if(this.cachedFeeConfig==null){
+      try{this.cachedFeeConfig=await this.client.request({method:"sim_getFeeConfig",params:[]});}catch(e){this.cachedFeeConfig=null;}
+    }
+    const c=this.cachedFeeConfig;
+    if(c==null||c.enabled==false||c.defaultFees==null)return{};
+    const d=c.defaultFees.distribution||{};
+    return{gas:500000n,fees:{distribution:createFeesDistribution({...d,rotations:d.rotations||["0"]}),feeValue:BigInt(c.defaultFees.feeValue||78852000002588)}};
+  }
+  /** Chain id the RPC answers with, as a number (Studionet is 61999; studio-dev / studio-next answer 61997). */
+  async chainId() { return Number(BigInt(await this.retrying('eth_chainId', () => this.client.request({ method: 'eth_chainId' })))); }
   async balance(address) { return BigInt(await this.retrying('getBalance', () => this.client.getBalance({ address }))); }
   async deploy(code, acct) {
-    const hash = await this.client.deployContract({ account: acct.account, code, args: [] });
+    const hash = await (async()=>{const v=await this.getV06TxParams('deploy',acct);return this.client.deployContract({account:acct.account,code,args:[],...v});})();
     const raw = await this.retrying('deploy receipt', () => this.client.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED, retries: this.retries, interval: this.intervalMs, fullTransaction: true }));
     const receipt = normalizeReceipt(hash, raw);
     return { receipt, address: receipt.contractAddress, raw };
@@ -102,7 +145,7 @@ export class RealChain {
   async send(acct, address, fn, args, value = 0n) {
     let hash;
     try {
-      hash = await this.retrying(`submit ${fn}`, () => this.client.writeContract({ account: acct.account, address, functionName: fn, args, value: BigInt(value) }), { shouldRetry: isRateLimitError });
+      hash = await this.retrying(`submit ${fn}`, () => (async()=>{const v=await this.getV06TxParams(fn,acct,address,args,value);return this.client.writeContract({account:acct.account,address,functionName:fn,args,value:BigInt(value),...v});})(), { shouldRetry: isRateLimitError });
     } catch (error) {
       error.submitted = isRateLimitError(error) ? 'no' : 'maybe';
       throw error;
@@ -132,17 +175,12 @@ export class RealChain {
     return this.retrying(`read ${fn}`, () => this.client.readContract({ address, functionName: fn, args }));
   }
   async contractCode(address) {
-    const url = this.rpc ?? studionet.rpcUrls.default.http[0];
-    return this.retrying('gen_getContractCode', async () => {
-      const response = await fetch(url, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'gen_getContractCode', params: [address] }),
-      });
-      const text = await response.text();
-      let payload;
-      try { payload = JSON.parse(text); } catch (error) { throw new Error(`gen_getContractCode: HTTP request failed (status ${response.status}), body is not valid JSON: ${text.slice(0, 80)}`); }
-      if (typeof payload.result !== 'string') throw new Error(`gen_getContractCode failed: ${JSON.stringify(payload).slice(0, 200)}`);
-      return Buffer.from(payload.result, 'base64');
+    const response = await fetch(this.rpc ?? studionet.rpcUrls.default.http[0], {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'gen_getContractCode', params: [address] }),
     });
+    const payload = await response.json();
+    if (typeof payload.result !== 'string') throw new Error(`gen_getContractCode failed: ${JSON.stringify(payload).slice(0, 200)}`);
+    return Buffer.from(payload.result, 'base64');
   }
 }

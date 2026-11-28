@@ -1,6 +1,4 @@
 node_modules/
-.venv/
-venv/
 artifacts/
 .genvmroot/
 .pytest_cache/

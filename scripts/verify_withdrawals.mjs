@@ -9,7 +9,9 @@
  * withdraw transaction and for the wallets' current balances.
  *
  *   - Reports written by the current live script carry `withdrawals` (balance before, amount, hash): each wallet is
- *     compared with `balanceBefore + amount`.
+ *     compared with `balanceBefore + amount`, less a transaction-fee allowance (the withdraw transaction's own fee left
+ *     the wallet at the same time, so an exact `+amount` can never be seen). The check is only meaningful while the
+ *     wallet has done nothing else since the run: spending from it afterwards can hide a credit.
  *   - Older reports only carry the transactions and the expected amounts: the script prints status and balance and
  *     cannot prove the credit by itself (there is no balance-before to compare with).
  *
@@ -18,7 +20,7 @@
 import { readFileSync } from 'node:fs';
 import { createClient } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
-import { retryTransient } from './lib/common.mjs';
+import { payoutArrived, retryTransient } from './lib/common.mjs';
 import { normalizeReceipt } from './lib/real_chain.mjs';
 
 const file = process.argv.slice(2).find((a) => !a.startsWith('--'));
@@ -42,14 +44,17 @@ if (!Array.isArray(rows) || rows.length === 0) {
 }
 if (rows.length === 0) { console.error('no withdraw transactions found in this report'); process.exit(1); }
 
+if (report.contract) {
+  const contractBalance = BigInt(await retry(() => client.getBalance({ address: report.contract })));
+  console.log(`contract ${report.contract} native balance now: ${contractBalance} wei (a fully wound-down contract holds 0, or only value that rejected payable calls left behind)`);
+}
 let allProven = true;
 for (const row of rows) {
   const status = normalizeReceipt(row.hash, await retry(() => client.getTransaction({ hash: row.hash }))).status;
   const balance = BigInt(await retry(() => client.getBalance({ address: row.address })));
   let verdict;
   if (row.balanceBefore != null && row.amount != null) {
-    const target = BigInt(row.balanceBefore) + BigInt(row.amount);
-    verdict = balance >= target ? 'CREDITED' : (status === 'FINALIZED' ? 'FINALIZED BUT NOT CREDITED' : 'PENDING FINALIZATION');
+    verdict = payoutArrived(row.balanceBefore, balance, row.amount) ? 'CREDITED' : (status === 'FINALIZED' ? 'FINALIZED BUT NOT CREDITED' : 'PENDING FINALIZATION');
   } else {
     verdict = status === 'FINALIZED' ? 'FINALIZED (credit not provable: no balance-before in this report)' : 'PENDING FINALIZATION';
   }

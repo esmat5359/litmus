@@ -24,7 +24,7 @@ contract from the agreed `verdict` and `factors` only, so they are equal on ever
 
 ## How the contract enforces it
 
-* `judge()` runs `gl.vm.run_nondet_unsafe(leader, validator)` with an **explicit** validator. No
+* `judge()` runs `gl.vm.run_nondet(leader, validator)` with an **explicit** validator. No
   `gl.eq_principle` helper is used: those are lenient or model-based.
 * The validator re-runs the whole assessment **independently**. The leader's answer is never put in the
   validator's prompt, so a validator cannot be anchored into agreement.

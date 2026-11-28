@@ -32,6 +32,27 @@ export const fmtGen = (v) => {
 };
 export const minBig = (a, b) => (a < b ? a : b);
 
+/**
+ * A wallet that withdrew `amount` ends up with `amount - fee` more than before the withdraw transaction was sent,
+ * because the transaction fee leaves the wallet at the same time (about 1.3e14 wei on Studionet). Comparing with
+ * `before + amount` therefore calls a correct payout "missing". The slack is far below every amount the live script
+ * withdraws (smallest: 5.1e15) and far above a fee, so a payout that never arrived (net change <= 0) is never accepted.
+ */
+export const FEE_SLACK_WEI = 5n * 10n ** 14n;
+export const payoutArrived = (before, now, amount) => BigInt(now) - BigInt(before) >= (BigInt(amount) > FEE_SLACK_WEI ? BigInt(amount) - FEE_SLACK_WEI : 1n);
+
+/** Can `target` be written as a sum of some of `values` (each used at most once)? Used to name stray contract balance. */
+export function isSubsetSum(values, target) {
+  let sums = new Set([0n]);
+  for (const v of values) {
+    const next = new Set(sums);
+    for (const s of sums) { const t = s + v; if (t <= target) next.add(t); }
+    sums = next;
+    if (sums.size > 200_000) return false;
+  }
+  return sums.has(target);
+}
+
 export function parseView(raw) {
   if (typeof raw !== 'string') return raw;
   const first = raw.trim()[0];

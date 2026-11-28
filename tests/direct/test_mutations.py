@@ -135,7 +135,7 @@ MUTANTS = {
     "repair_leader_output": ("        proposed = leader_result.calldata\n        if not is_canonical(proposed, n_factors, allowed):\n            return False\n",
         "        proposed = normalize_ruling(leader_result.calldata, n_factors, allowed)\n        if proposed is None:\n            return False\n",
         check_equality_law),
-    "accept_any_leader_error": ("            if not str(leader_result.message).startswith(\"[LLM_ERROR]\"):\n                return False\n            try:\n                assess(prompt, n_factors, allowed)\n            except gl.vm.UserError:\n                return True\n            except Exception:\n                return False\n            return False\n",
+    "accept_any_leader_error": ("            if not str(leader_result.data).startswith(\"[LLM_ERROR]\"):\n                return False\n            try:\n                assess(prompt, n_factors, allowed)\n            except gl.vm.UserError:\n                return True\n            except Exception:\n                return False\n            return False\n",
         "            return True\n", check_equality_law),
     "validator_always_true": ("        if not isinstance(leader_result, gl.vm.Return):\n            return False\n",
         "        return True\n", check_equality_law),

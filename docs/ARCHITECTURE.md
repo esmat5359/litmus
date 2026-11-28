@@ -1,7 +1,7 @@
 # Architecture
 
-Single contract, `Litmus` (`contracts/Litmus.py`), GenVM v0.2.16, runner
-`py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`.
+Single contract, `Litmus` (`contracts/Litmus.py`), GenVM v0.4 (header `# v0.4.0`), runner
+`py-genlayer:kzybg95x1gn21dw72m7hyg0maaap04n4nx55j9yt6fkdqxtz6bz0`.
 
 ## Storage
 
@@ -66,5 +66,31 @@ on time or on already agreed data is permissionless.
 ## Withdrawals
 
 `withdraw` zeroes the wallet's ledger entry and the totals **before** emitting
-`emit_transfer(value=amount)` and refuses if the contract's native balance is below the amount. Transfers
-are emitted on finalization (the SDK default), so a wallet is credited when the transaction finalizes.
+`gl.chain.Account(address).emit_transfer(value=amount)` (the v0.4 form; `gl.get_contract_at(...).emit_transfer` is gone) and
+refuses if the contract's native balance is below the amount. The transfer is an emitted message that sends value only and
+never runs code at the receiver; it is applied on finalization, so a wallet is credited when the transaction finalizes. On
+Studio v0.123 (Consensus v0.6) the transaction that emits it must carry `messageAllocations` in its fees; the live script
+obtains them from `estimateTransactionFeesForWrite`.
+
+## GenVM v0.4 port (Studio v0.123)
+
+The v0.2.16 contract was ported without changing a rule, an amount or a method signature (24 methods: 8 views, 16 writes):
+
+| v0.2 | v0.4 |
+|---|---|
+| `# { "Depends": "py-genlayer:1jb45aa8..." }` on line 1 | `# v0.4.0` on line 1, `# { "Depends": "py-genlayer:kzybg95x1gn21dw72m7hyg0maaap04n4nx55j9yt6fkdqxtz6bz0" }` on line 2 |
+| `from genlayer import *` (bound `gl`) | `import genlayer as gl`, `from genlayer.types import *`, `from genlayer.storage import TreeMap` |
+| `class Litmus(gl.Contract)` | `class Litmus(gl.contract.Contract)` |
+| `gl.vm.run_nondet_unsafe(leader, validator)` | `gl.vm.run_nondet(leader, validator)` |
+| `leader_result.message` of a `gl.vm.UserError` | `leader_result.data` |
+| `gl.get_contract_at(Address(who)).emit_transfer(value=...)` | `gl.chain.Account(Address(who)).emit_transfer(value=...)` |
+
+Audited and already compliant, no change needed: no child contracts (`salt_nonce` / `gl.contract.Salted` do not apply, so no
+child address changes), no `__receive__` (value enters only through the four named `@gl.public.write.payable` methods),
+no decorator on `__init__`, every persistent field is a GenVM storage type (`u32`, `u256`, `TreeMap`), and the
+nondeterministic closures capture only a `str`, an `int` and a tuple, so no `gl.storage.copy_to_memory` is needed.
+`tests/test_static_guards.py` pins all of this.
+
+**The v0.4 contract is a new contract**: v0.2 contracts keep their address and state on Studio v0.123 for now, but nothing
+migrates. Deploy it fresh (`node scripts/live_e2e.mjs` deploys, source-checks and records the new address) and use the new
+address everywhere.

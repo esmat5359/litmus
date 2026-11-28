@@ -1,4 +1,4 @@
-"""Shared Direct Mode helpers for the Litmus test-suite (real GenVM v0.2.16 SDK, no RPC)."""
+"""Shared Direct Mode helpers for the Litmus test-suite (real GenVM v0.4 SDK from the Studio v0.123 release, no RPC)."""
 import json
 import sys
 
@@ -204,9 +204,10 @@ def build_world(direct_deploy, direct_vm, direct_accounts, path=CONTRACT):
             message = request["PostMessage"]
             address = message["address"]
             hexed = (address.as_hex if hasattr(address, "as_hex") else "0x" + bytes(address).hex()).lower()
-            w.transfers.append({"to": hexed, "value": int(message["value"]),
-                                "method": message["calldata"].get("method") if isinstance(message["calldata"], dict) else None,
-                                "on": message["on"]})
+            body = message.get("calldata")
+            # the v0.6 calldata ABI names the method key "" (older ABIs used "method"); a plain value transfer has none
+            method = (body.get("method", body.get("")) if isinstance(body, dict) else None)
+            w.transfers.append({"to": hexed, "value": int(message["value"]), "method": method, "on": message.get("on")})
         return original(data)
 
     wasi.gl_call = spy

@@ -74,13 +74,22 @@ export class MockChain {
   /**
    * flipAppeals        - appeals reverse the first ruling.
    * retainRejectedValue - behave like Studionet: value attached to a REJECTED payable call stays in the contract.
+   * refundRejectedLate - behave like the Studionet run of 2026-11-26: value attached to a REJECTED payable call sits in
+   *                      the contract until that transaction finalizes and is then returned to the sender.
+   * lateTransfers       - withdraw() transfers leave the contract AND reach the wallet only on finalization (the contract
+   *                      balance does not fall at acceptance).
+   * lostTransfers       - withdraw() transactions finalize but the emitted transfer is never applied (a payout defect).
    * flakyRpc           - inject the two transport failures seen on Studionet: a rate-limit refusal before submission,
    *                      and a gateway error for a rejected appeal that nevertheless reached the chain.
    */
-  constructor({ flipAppeals = false, retainRejectedValue = false, flakyRpc = false } = {}) {
+  constructor({ flipAppeals = false, retainRejectedValue = false, refundRejectedLate = false, lateTransfers = false, lostTransfers = false, flakyRpc = false } = {}) {
     this.isDryRun = true;
     this.flip = flipAppeals;
     this.retain = retainRejectedValue;
+    this.refundLate = refundRejectedLate;
+    this.lateTransfers = lateTransfers;
+    this.lostTransfers = lostTransfers;
+    this.pendingRefunds = [];
     this.flaky = flakyRpc;
     this.sendCount = 0;
     this.ambiguousDone = false;
@@ -105,13 +114,22 @@ export class MockChain {
     this.balances.set(address, 0n);
     return acct;
   }
+  async chainId() { return 61999; }
   async fundAccount(address, amount) { this.balances.set(address, (this.balances.get(address) ?? 0n) + BigInt(amount)); }
   async balance(address) { return address === this.contract ? this.contractBalance : (this.balances.get(address) ?? 0n); }
   flushTransfers() {
     for (const t of this.pendingTransfers) {
-      if (t.ready <= this.clockMs) { this.balances.set(t.to, (this.balances.get(t.to) ?? 0n) + t.amount); t.done = true; }
+      if (t.ready <= this.clockMs) {
+        if (t.fromContract) this.contractBalance -= t.amount;
+        this.balances.set(t.to, (this.balances.get(t.to) ?? 0n) + t.amount);
+        t.done = true;
+      }
     }
     this.pendingTransfers = this.pendingTransfers.filter((t) => !t.done);
+    for (const r of this.pendingRefunds) {
+      if (r.ready <= this.clockMs) { this.contractBalance -= r.amount; this.balances.set(r.to, (this.balances.get(r.to) ?? 0n) + r.amount); r.done = true; }
+    }
+    this.pendingRefunds = this.pendingRefunds.filter((r) => !r.done);
   }
   async deploy(code, acct) {
     this.clockMs += 15_000;
@@ -159,6 +177,10 @@ export class MockChain {
       if (this.retain && BigInt(value) > 0n && (balances.get(acct.address) ?? 0n) >= BigInt(value)) {
         this.balances.set(acct.address, balances.get(acct.address) - BigInt(value));
         this.contractBalance = contractBalance + BigInt(value);
+      } else if (this.refundLate && BigInt(value) > 0n && (balances.get(acct.address) ?? 0n) >= BigInt(value)) {
+        this.balances.set(acct.address, balances.get(acct.address) - BigInt(value));
+        this.contractBalance = contractBalance + BigInt(value);
+        this.pendingRefunds.push({ to: acct.address, amount: BigInt(value), ready: this.clockMs + 100_000 });
       }
       entry.ok = false;
       entry.llm = entry.llm;
@@ -316,6 +338,8 @@ export class MockChain {
         const amount = S.claimable[ctx.sender] ?? 0n; need(amount > 0n, 'nothing to withdraw'); need(this.contractBalance >= amount, 'balance too low');
         S.claimable[ctx.sender] = 0n; S.claimableTotal -= amount; S.escrow -= amount;
         ctx.entry.transfer = amount.toString();
+        if (this.lostTransfers) return;   // finalizes, but the emitted transfer is never applied
+        if (this.lateTransfers) { this.pendingTransfers.push({ to: ctx.sender, amount, ready: this.clockMs + 150_000, fromContract: true }); return; }
         this.contractBalance -= amount;
         this.pendingTransfers.push({ to: ctx.sender, amount, ready: this.clockMs + 60_000 });
         return;

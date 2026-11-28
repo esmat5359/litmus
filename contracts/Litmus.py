@@ -1,4 +1,5 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# v0.4.0
+# { "Depends": "py-genlayer:kzybg95x1gn21dw72m7hyg0maaap04n4nx55j9yt6fkdqxtz6bz0" }
 """LITMUS: rules that must pass their own test before they are allowed to rule.
 
 A rule author writes a rule, a short list of aggravating factors and a set of
@@ -18,9 +19,11 @@ Consensus law of this contract (see docs/CONSENSUS.md):
 * Only the free-text ``reason`` is compared loosely (it must be a sane,
   bounded, non-empty string).  It is never decision-bearing.
 
-Targets GenVM v0.2.16 (stable).
+Targets GenVM v0.4 (Studio v0.123, Consensus v0.6).
 """
-from genlayer import *
+import genlayer as gl
+from genlayer.storage import TreeMap
+from genlayer.types import *
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -202,7 +205,7 @@ def judge(prompt, n_factors, allowed):
         if isinstance(leader_result, gl.vm.UserError):
             # The leader found no usable model answer.  Nothing is stored in that case, so the
             # validators may agree to fail - but only if they independently fail the same way.
-            if not str(leader_result.message).startswith("[LLM_ERROR]"):
+            if not str(leader_result.data).startswith("[LLM_ERROR]"):
                 return False
             try:
                 assess(prompt, n_factors, allowed)
@@ -223,7 +226,7 @@ def judge(prompt, n_factors, allowed):
         return (proposed["verdict"] == mine["verdict"]
                 and proposed["factors"] == mine["factors"])
 
-    result = gl.vm.run_nondet_unsafe(leader, validator)
+    result = gl.vm.run_nondet(leader, validator)
     ruling = normalize_ruling(result, n_factors, allowed)
     if ruling is None:
         raise gl.vm.UserError("validator-agreed result invalid")
@@ -287,7 +290,7 @@ def rule_digest(rule):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-class Litmus(gl.Contract):
+class Litmus(gl.contract.Contract):
     rule_count: u32
     case_count: u32
     escrow_total: u256
@@ -753,7 +756,7 @@ class Litmus(gl.Contract):
         self.claimable[who] = u256(0)
         self.claimable_total = u256(int(self.claimable_total) - amount)
         self.escrow_total = u256(int(self.escrow_total) - amount)
-        gl.get_contract_at(Address(who)).emit_transfer(value=u256(amount))
+        gl.chain.Account(Address(who)).emit_transfer(value=u256(amount))
 
     # -------------------------------------------------------------------- views
     @gl.public.view

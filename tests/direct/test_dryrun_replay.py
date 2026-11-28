@@ -39,7 +39,7 @@ def convert(value, mapping):
     return value
 
 
-@pytest.mark.parametrize("flags", [(), ("--flip-appeals",), ("--skip-slow",)])
+@pytest.mark.parametrize("flags", [(), ("--flip-appeals",), ("--skip-slow",), ("--refund-rejected-late", "--late-transfers")])
 def test_js_model_and_script_match_the_python_contract(world, tmp_path, flags):
     data = run_dry(tmp_path, *flags)
     mapping = {addr.lower(): world.w(i) for i, addr in enumerate(data["accounts"])}
